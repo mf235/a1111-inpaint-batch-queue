@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 APP_TITLE = "A1111 Inpaint Batch Queue"
-APP_REV = "v14"
+APP_REV = "v15"
 SETTINGS_NAME = "a1111-inpaint-batch-queue-settings.json"
 PROJECT_FILE_NAME = "project.json"
 PROJECT_SETTINGS_NAME = "settings.json"
@@ -705,14 +705,19 @@ class MaskCanvas(QWidget):
             painter.setClipRect(img_rect)
             live_color = QColor(100, 210, 255, 150) if self._live_draw_tool == "eraser" else QColor(255, 230, 80, 145)
             live_width = max(1.0, self._live_draw_brush_size * scale)
-            painter.setPen(QPen(live_color, live_width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
             if len(self._live_draw_points) == 1:
                 vp0 = self.image_to_view(self._live_draw_points[0])
                 if vp0 is not None:
+                    # 単発クリックのプレビューは塗り円だけ描く。
+                    # 太いペンを付けたまま drawEllipse すると、外周線の分だけブラシより大きく見える。
+                    no_pen = QPen()
+                    no_pen.setStyle(Qt.PenStyle.NoPen)
+                    painter.setPen(no_pen)
                     painter.setBrush(live_color)
                     painter.drawEllipse(vp0, live_width / 2.0, live_width / 2.0)
                     painter.setBrush(Qt.BrushStyle.NoBrush)
             else:
+                painter.setPen(QPen(live_color, live_width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
                 start = self.image_to_view(self._live_draw_points[0])
                 if start is not None:
                     path = QPainterPath(start)
