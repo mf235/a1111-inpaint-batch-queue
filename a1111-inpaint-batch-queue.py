@@ -17,6 +17,7 @@ import json
 import math
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -29,7 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 APP_TITLE = "A1111 Inpaint Batch Queue"
-APP_REV = "v15"
+APP_REV = "v16"
 SETTINGS_NAME = "a1111-inpaint-batch-queue-settings.json"
 PROJECT_FILE_NAME = "project.json"
 PROJECT_SETTINGS_NAME = "settings.json"
@@ -38,6 +39,11 @@ MASK_FILE_NAME = "mask.png"
 JOB_FILE_NAME = "job.json"
 RESULT_DIR_NAME = "result"
 REQUEST_FILE_NAME = "request.json"
+MAX_API_SIZE_OPTIONS = {
+    "unlimited": None,
+    "1920x1080": (1920, 1080),
+    "1280x720": (1280, 720),
+}
 
 try:
     import numpy as np
@@ -59,7 +65,7 @@ except Exception as exc:  # pragma: no cover
 
 try:
     from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
-    from PySide6.QtGui import QAction, QColor, QDragEnterEvent, QDropEvent, QImage, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QWheelEvent, QTextCursor
+    from PySide6.QtGui import QAction, QActionGroup, QColor, QDragEnterEvent, QDropEvent, QImage, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QWheelEvent, QTextCursor
     from PySide6.QtWidgets import (
         QApplication,
         QAbstractItemView,
@@ -243,6 +249,56 @@ def numpy_mask_to_png_base64(mask: np.ndarray) -> str:
     return base64.b64encode(buf.tobytes()).decode("ascii")
 
 
+def numpy_rgba_to_png_base64(rgba: np.ndarray) -> str:
+    if rgba.ndim != 3 or rgba.shape[2] != 4:
+        raise ValueError("RGBA画像ではありません。")
+    bgra = cv2.cvtColor(rgba.astype(np.uint8), cv2.COLOR_RGBA2BGRA)
+    ok, buf = cv2.imencode(".png", bgra)
+    if not ok:
+        raise ValueError("画像PNGエンコードに失敗しました。")
+    return base64.b64encode(buf.tobytes()).decode("ascii")
+
+
+def resized_for_api(rgba: np.ndarray, mask: np.ndarray, max_size_key: str) -> Tuple[np.ndarray, np.ndarray, bool]:
+    limit = MAX_API_SIZE_OPTIONS.get(max_size_key)
+    if limit is None:
+        return rgba, mask, False
+    max_w, max_h = limit
+    h, w = rgba.shape[:2]
+    if w <= 0 or h <= 0:
+        return rgba, mask, False
+    scale = min(float(max_w) / float(w), float(max_h) / float(h), 1.0)
+    if scale >= 0.999999:
+        return rgba, mask, False
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    rgba_out = cv2.resize(rgba.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+    mask_out = cv2.resize(mask.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+    return np.ascontiguousarray(rgba_out), np.ascontiguousarray(mask_out), True
+
+
+def open_path_in_explorer(path: Path, select_file: bool = False) -> None:
+    path = Path(path)
+    if sys.platform.startswith("win"):
+        try:
+            if select_file and path.is_file():
+                subprocess.Popen(["explorer", f"/select,{str(path)}"])
+            else:
+                target = path if path.is_dir() else path.parent
+                os.startfile(str(target))  # type: ignore[attr-defined]
+            return
+        except Exception:
+            pass
+    try:
+        target = path.parent if select_file and path.is_file() else path
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", str(target)])
+        else:
+            subprocess.Popen(["xdg-open", str(target)])
+    except Exception:
+        pass
+
+
 def decode_api_image_to_rgba(text_b64: str) -> np.ndarray:
     if "," in text_b64 and text_b64.strip().startswith("data:"):
         text_b64 = text_b64.split(",", 1)[1]
@@ -414,6 +470,7 @@ class MaskCanvas(QWidget):
     toolChanged = Signal(str)
     zoomChanged = Signal(float)
     fileDropped = Signal(list)
+    resultNavigate = Signal(int)
 
     MIN_ZOOM_SCALE = 0.05
     MAX_ZOOM_SCALE = 40.0
@@ -921,6 +978,14 @@ class MaskCanvas(QWidget):
             self.set_tool("eraser")
             event.accept()
             return
+        if key in (Qt.Key.Key_Left, Qt.Key.Key_Up):
+            self.resultNavigate.emit(-1)
+            event.accept()
+            return
+        if key in (Qt.Key.Key_Right, Qt.Key.Key_Down):
+            self.resultNavigate.emit(1)
+            event.accept()
+            return
         if key == Qt.Key.Key_Space:
             self.space_down = True
             self.setCursor(Qt.CursorShape.OpenHandCursor)
@@ -1063,6 +1128,7 @@ class MainWindow(QMainWindow):
         self.jobs: List[JobData] = []
         self.current_job_index: Optional[int] = None
         self.api_settings = ApiSettings()
+        self.api_max_size = "unlimited"
         self.loading_ui = True
         self._refreshing_job_list = False
         self._selecting_job = False
@@ -1145,18 +1211,19 @@ class MainWindow(QMainWindow):
         self.canvas.maskChanged.connect(self.on_mask_changed)
         self.canvas.toolChanged.connect(self.on_canvas_tool_changed)
         self.canvas.fileDropped.connect(self.add_image_paths)
+        self.canvas.resultNavigate.connect(self.navigate_result_selection)
         layout.addWidget(self.canvas, 1)
 
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("表示"))
         self.mode_combo = QComboBox()
-        self.mode_combo.addItem("画像", "image")
-        self.mode_combo.addItem("マスク", "mask")
-        self.mode_combo.addItem("合成", "overlay")
-        self.mode_combo.addItem("最新結果", "result")
-        self.mode_combo.setCurrentIndex(2)
-        self.mode_combo.currentIndexChanged.connect(lambda _i: self.canvas.set_mode(self.mode_combo.currentData()))
+        self.mode_combo.setMinimumWidth(170)
+        self.mode_combo.currentIndexChanged.connect(self.on_display_combo_changed)
+        self.open_result_btn = QPushButton("開く")
+        self.open_result_btn.clicked.connect(self.open_selected_result_path)
         row1.addWidget(self.mode_combo)
+        row1.addWidget(self.open_result_btn)
+        self.refresh_display_combo(None, preferred_mode="overlay")
         row1.addSpacing(10)
         self.brush_btn = QPushButton("ブラシ [1]")
         self.brush_btn.setCheckable(True)
@@ -1302,6 +1369,37 @@ class MainWindow(QMainWindow):
         fit_action = QAction("表示合わせ", self); fit_action.setShortcut("F"); fit_action.triggered.connect(self.canvas.fit_to_window)
         actual_action = QAction("100%", self); actual_action.setShortcut("Ctrl+1"); actual_action.triggered.connect(self.canvas.set_actual_size)
         view_menu.addAction(fit_action); view_menu.addAction(actual_action)
+        settings_menu = self.menuBar().addMenu("設定")
+        max_menu = settings_menu.addMenu("最大サイズ")
+        self.max_size_action_group = QActionGroup(self)
+        self.max_size_action_group.setExclusive(True)
+        self.max_size_actions: Dict[str, QAction] = {}
+        for label, key in [("無制限", "unlimited"), ("1920x1080", "1920x1080"), ("1280x720", "1280x720")]:
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.triggered.connect(lambda checked=False, k=key: self.set_api_max_size(k))
+            self.max_size_action_group.addAction(action)
+            self.max_size_actions[key] = action
+            max_menu.addAction(action)
+        self.sync_max_size_actions()
+
+    def set_api_max_size(self, key: str) -> None:
+        if key not in MAX_API_SIZE_OPTIONS:
+            key = "unlimited"
+        if self.api_max_size != key:
+            self.api_max_size = key
+            self.sync_max_size_actions()
+            self._save_app_settings()
+            label = "無制限" if key == "unlimited" else key
+            self.log(f"API最大サイズ: {label}")
+
+    def sync_max_size_actions(self) -> None:
+        actions = getattr(self, "max_size_actions", {})
+        key = self.api_max_size if self.api_max_size in MAX_API_SIZE_OPTIONS else "unlimited"
+        for action_key, action in actions.items():
+            action.blockSignals(True)
+            action.setChecked(action_key == key)
+            action.blockSignals(False)
 
     # ---------- settings ----------
     def _load_app_settings(self) -> None:
@@ -1309,6 +1407,9 @@ class MainWindow(QMainWindow):
         if not isinstance(data, dict):
             data = {}
         self.api_settings = ApiSettings.from_dict(data.get("api", {}))
+        max_size = str(data.get("max_api_size", "unlimited"))
+        self.api_max_size = max_size if max_size in MAX_API_SIZE_OPTIONS else "unlimited"
+        self.sync_max_size_actions()
         proj = str(data.get("last_project", "")).strip()
         if proj:
             self.project_dir = Path(proj)
@@ -1347,6 +1448,7 @@ class MainWindow(QMainWindow):
                 "app_rev": APP_REV,
                 "last_project": str(self.project_dir),
                 "api": self.api_settings.to_dict(),
+                "max_api_size": self.api_max_size,
                 "window": {
                     "normal_geometry": {"x": geom.x(), "y": geom.y(), "width": geom.width(), "height": geom.height()},
                     "maximized": bool(self.isMaximized()),
@@ -1601,6 +1703,7 @@ class MainWindow(QMainWindow):
                 self.prompt_edit.setPlainText("")
                 self.negative_edit.setPlainText("")
                 self.canvas.set_images(None, None, None)
+                self.refresh_display_combo(None, preferred_mode="overlay")
                 return
             self.job_name_edit.setText(job.name)
             self.checked_box.setChecked(job.checked)
@@ -1629,8 +1732,10 @@ class MainWindow(QMainWindow):
                     result = cv2_read_rgba_unicode(result_path)
                 except Exception:
                     result = None
+            preferred_mode = self.current_display_mode()
+            self.refresh_display_combo(job, preferred_mode=preferred_mode, select_rel=job.latest_result if preferred_mode == "result" else "")
             self.canvas.set_images(base, mask, result, fit=True)
-            self.canvas.set_mode(self.mode_combo.currentData())
+            self.canvas.set_mode(self.current_display_mode())
         except Exception as exc:
             self.log(f"ジョブ読込失敗: {safe_exception_text(exc)}")
             print(f"Job load error: {safe_exception_text(exc)}", file=sys.stderr)
@@ -1739,12 +1844,13 @@ class MainWindow(QMainWindow):
         mask_path = self.job_mask_abs(job)
         base = cv2_read_rgba_unicode(input_path)
         mask = cv2_read_mask_unicode(mask_path, (base.shape[1], base.shape[0])) if mask_path.exists() else np.zeros(base.shape[:2], dtype=np.uint8)
+        base_api, mask_api, _resized = resized_for_api(base, mask, self.api_max_size)
         p = job.params
-        w = p.width or int(base.shape[1])
-        h = p.height or int(base.shape[0])
+        w = p.width or int(base_api.shape[1])
+        h = p.height or int(base_api.shape[0])
         req = {
-            "init_images": [pil_image_to_png_base64(input_path)],
-            "mask": numpy_mask_to_png_base64(mask),
+            "init_images": [numpy_rgba_to_png_base64(base_api)],
+            "mask": numpy_mask_to_png_base64(mask_api),
             "prompt": p.prompt,
             "negative_prompt": p.negative_prompt,
             "sampler_name": p.sampler_name,
@@ -1872,12 +1978,131 @@ class MainWindow(QMainWindow):
         job = self.current_job()
         if job is None or job.job_id != job_id:
             return
-        p = self.job_latest_result_abs(job)
-        if p is not None:
+        self.refresh_display_combo(job, preferred_mode=self.current_display_mode(), select_rel=job.latest_result)
+        p = self.result_abs(job, job.latest_result) if job.latest_result else self.job_latest_result_abs(job)
+        if p is not None and p.exists():
             try:
                 self.canvas.set_result(cv2_read_rgba_unicode(p))
+                if self.current_display_mode() == "result":
+                    self.canvas.set_mode("result")
             except Exception:
                 pass
+
+    # ---------- result display ----------
+    def display_item_data(self, index: Optional[int] = None) -> Dict[str, str]:
+        combo_index = self.mode_combo.currentIndex() if index is None else int(index)
+        data = self.mode_combo.itemData(combo_index) if combo_index >= 0 else None
+        if isinstance(data, dict):
+            return {"mode": str(data.get("mode", "overlay")), "rel": str(data.get("rel", ""))}
+        if isinstance(data, str):
+            return {"mode": data, "rel": ""}
+        return {"mode": "overlay", "rel": ""}
+
+    def current_display_mode(self) -> str:
+        mode = self.display_item_data().get("mode", "overlay")
+        return mode if mode in {"image", "mask", "overlay", "result"} else "overlay"
+
+    def result_dir(self, job: JobData) -> Path:
+        return self.job_dir(job.job_id) / RESULT_DIR_NAME
+
+    def result_abs(self, job: JobData, rel_path: str) -> Path:
+        return self.job_dir(job.job_id) / rel_path
+
+    def result_entries(self, job: Optional[JobData]) -> List[Tuple[str, Path]]:
+        if job is None:
+            return []
+        out_dir = self.result_dir(job)
+        if not out_dir.exists():
+            return []
+        paths = [p for p in out_dir.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTS]
+        paths.sort(key=lambda p: (p.stat().st_mtime, p.name.lower()))
+        entries: List[Tuple[str, Path]] = []
+        for p in paths:
+            rel = str(p.relative_to(self.job_dir(job.job_id))).replace("\\", "/")
+            entries.append((rel, p))
+        return entries
+
+    def refresh_display_combo(self, job: Optional[JobData], preferred_mode: str = "overlay", select_rel: str = "") -> None:
+        preferred_mode = preferred_mode if preferred_mode in {"image", "mask", "overlay", "result"} else "overlay"
+        entries = self.result_entries(job)
+        self.mode_combo.blockSignals(True)
+        try:
+            self.mode_combo.clear()
+            static_items = [("画像", "image"), ("マスク", "mask"), ("合成", "overlay")]
+            for label, mode in static_items:
+                self.mode_combo.addItem(label, {"mode": mode, "rel": ""})
+            selected_index = 2
+            if preferred_mode in {"image", "mask", "overlay"}:
+                selected_index = {"image": 0, "mask": 1, "overlay": 2}.get(preferred_mode, 2)
+            result_start = self.mode_combo.count()
+            for i, (rel, _path) in enumerate(entries, 1):
+                self.mode_combo.addItem(f"出力結果({i:03d})", {"mode": "result", "rel": rel})
+                if preferred_mode == "result" and select_rel and rel == select_rel:
+                    selected_index = result_start + i - 1
+            if preferred_mode == "result" and entries and (selected_index < result_start):
+                # 指定結果がない場合は最新相当の最後の出力を選ぶ。
+                selected_index = self.mode_combo.count() - 1
+            self.mode_combo.setCurrentIndex(selected_index)
+        finally:
+            self.mode_combo.blockSignals(False)
+        self.on_display_combo_changed(self.mode_combo.currentIndex())
+
+    def on_display_combo_changed(self, _index: int) -> None:
+        data = self.display_item_data()
+        mode = data.get("mode", "overlay")
+        if mode == "result":
+            job = self.current_job()
+            rel = data.get("rel", "")
+            result_path = self.result_abs(job, rel) if job is not None and rel else None
+            if result_path is not None and result_path.exists():
+                try:
+                    self.canvas.set_result(cv2_read_rgba_unicode(result_path))
+                except Exception as exc:
+                    self.log(f"出力結果読込失敗: {safe_exception_text(exc)}")
+            self.canvas.set_mode("result")
+            return
+        self.canvas.set_mode(mode)
+
+    def selected_result_path(self) -> Optional[Path]:
+        job = self.current_job()
+        if job is None:
+            return None
+        data = self.display_item_data()
+        if data.get("mode") != "result" or not data.get("rel"):
+            return None
+        path = self.result_abs(job, data["rel"])
+        return path if path.exists() else None
+
+    def open_selected_result_path(self) -> None:
+        job = self.current_job()
+        if job is None:
+            return
+        result_path = self.selected_result_path()
+        if result_path is not None:
+            open_path_in_explorer(result_path, select_file=True)
+            return
+        folder = self.result_dir(job)
+        folder.mkdir(parents=True, exist_ok=True)
+        open_path_in_explorer(folder, select_file=False)
+
+    def result_combo_indexes(self) -> List[int]:
+        indexes = []
+        for i in range(self.mode_combo.count()):
+            if self.display_item_data(i).get("mode") == "result":
+                indexes.append(i)
+        return indexes
+
+    def navigate_result_selection(self, delta: int) -> None:
+        indexes = self.result_combo_indexes()
+        if not indexes:
+            return
+        current = self.mode_combo.currentIndex()
+        if current in indexes:
+            pos = indexes.index(current)
+            next_pos = clamp_int(pos + int(delta), 0, len(indexes) - 1)
+        else:
+            next_pos = 0 if delta > 0 else len(indexes) - 1
+        self.mode_combo.setCurrentIndex(indexes[next_pos])
 
     # ---------- window/system events ----------
     def log(self, text: str) -> None:
