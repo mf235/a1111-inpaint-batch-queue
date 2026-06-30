@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 APP_TITLE = "A1111 Inpaint Batch Queue"
-APP_REV = "v33"
+APP_REV = "v34"
 SETTINGS_NAME = "a1111-inpaint-batch-queue-settings.json"
 PROJECT_FILE_NAME = "project.json"
 PROJECT_SETTINGS_NAME = "settings.json"
@@ -38,6 +38,7 @@ SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 MASK_FILE_NAME = "mask.png"
 JOB_FILE_NAME = "job.json"
 RESULT_DIR_NAME = "result"
+DEBUG_DIR_NAME = "debug"
 REQUEST_FILE_NAME = "request.json"
 MAX_API_SIZE_OPTIONS = {
     "unlimited": None,
@@ -2900,7 +2901,7 @@ class MainWindow(QMainWindow):
         self.api_settings = dlg.collect()
         self._save_app_settings()
 
-    def build_request_for_job(self, job: JobData) -> dict:
+    def build_request_for_job(self, job: JobData) -> Tuple[dict, ApiImagePrep, np.ndarray, np.ndarray]:
         input_path = self.job_input_abs(job)
         mask_path = self.job_mask_abs(job)
         base = cv2_read_rgba_unicode(input_path)
@@ -2938,7 +2939,44 @@ class MainWindow(QMainWindow):
             "restore_faces": p.restore_faces,
             "include_init_images": False,
         }
-        return req
+        return req, prep, base, mask
+
+    def save_api_debug_artifacts(self, job: JobData, req: dict, prep: ApiImagePrep, base_full: np.ndarray, mask_full: np.ndarray) -> Path:
+        debug_dir = self.job_dir(job.job_id) / DEBUG_DIR_NAME
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        base_api = np.ascontiguousarray(prep.base_api)
+        mask_api = np.ascontiguousarray(prep.mask_api.astype(np.uint8))
+        overlay_base = base_api
+        if overlay_base.ndim == 3 and overlay_base.shape[2] == 3:
+            overlay_base = cv2.cvtColor(overlay_base, cv2.COLOR_RGB2RGBA)
+        elif overlay_base.ndim == 2:
+            overlay_base = cv2.cvtColor(overlay_base, cv2.COLOR_GRAY2RGBA)
+        overlay_api = overlay_rgba(overlay_base, mask_api)
+        cv2_write_png_unicode(debug_dir / 'debug_api_input.png', base_api)
+        cv2_write_png_unicode(debug_dir / 'debug_api_mask.png', mask_api)
+        cv2_write_png_unicode(debug_dir / 'debug_api_overlay.png', overlay_api)
+        rect = prep.paste_rect
+        saved_rect = normalize_crop_rect_data(job.crop_rect, (int(base_full.shape[1]), int(base_full.shape[0]))) if job.crop_enabled else None
+        meta = {
+            'job_id': job.job_id,
+            'job_name': job.name,
+            'input_image_size': {'w': int(base_full.shape[1]), 'h': int(base_full.shape[0])},
+            'crop_enabled': bool(job.crop_enabled),
+            'saved_crop_rect': {'x': saved_rect[0], 'y': saved_rect[1], 'w': saved_rect[2], 'h': saved_rect[3]} if saved_rect else None,
+            'api_crop_rect': {'x': rect[0], 'y': rect[1], 'w': rect[2], 'h': rect[3]} if rect else None,
+            'api_input_size': {'w': int(base_api.shape[1]), 'h': int(base_api.shape[0])},
+            'api_mask_nonzero': int(np.count_nonzero(mask_api)),
+            'paste_canvas_size': {'w': int(prep.paste_canvas_size[0]), 'h': int(prep.paste_canvas_size[1])} if prep.paste_canvas_size else None,
+            'request_width': int(req.get('width', 0)),
+            'request_height': int(req.get('height', 0)),
+            'resize_mode': req.get('resize_mode'),
+            'inpaint_full_res': req.get('inpaint_full_res'),
+            'inpaint_full_res_padding': req.get('inpaint_full_res_padding'),
+            'mask_blur': req.get('mask_blur'),
+            'api_max_size': self.api_max_size,
+        }
+        write_json_utf8(debug_dir / 'debug_request_meta.json', meta)
+        return debug_dir
 
     def dry_run_current(self) -> None:
         if not self.confirm_unsaved_current_job():
@@ -2947,9 +2985,11 @@ class MainWindow(QMainWindow):
         if job is None:
             return
         try:
-            req = self.build_request_for_job(job)
+            req, prep, base_full, mask_full = self.build_request_for_job(job)
             write_json_utf8(self.job_dir(job.job_id) / REQUEST_FILE_NAME, req)
+            debug_dir = self.save_api_debug_artifacts(job, req, prep, base_full, mask_full)
             self.log(f"DryRun保存: {self.job_dir(job.job_id) / REQUEST_FILE_NAME}")
+            self.log(f"API debug保存: {debug_dir}")
         except Exception as exc:
             self.log(f"DryRun失敗: {exc}")
 
@@ -3006,12 +3046,10 @@ class MainWindow(QMainWindow):
                 try:
                     job.status = "実行中"
                     self.ui_refresh_jobs()
-                    req = self.build_request_for_job(job)
+                    req, prep, base_full, mask_full = self.build_request_for_job(job)
                     write_json_utf8(self.job_dir(job.job_id) / REQUEST_FILE_NAME, req)
-                    base_full = cv2_read_rgba_unicode(self.job_input_abs(job))
-                    mask_full_path = self.job_mask_abs(job)
-                    mask_full = cv2_read_mask_unicode(mask_full_path, (base_full.shape[1], base_full.shape[0])) if mask_full_path.exists() else np.zeros(base_full.shape[:2], dtype=np.uint8)
-                    prep = prepare_image_pair_for_api(base_full, mask_full, job.crop_enabled, job.crop_rect, self.api_max_size)
+                    debug_dir = self.save_api_debug_artifacts(job, req, prep, base_full, mask_full)
+                    self.ui_log(f"API debug保存: {debug_dir}")
                     crop_rect = prep.paste_rect
                     paste_canvas_size = prep.paste_canvas_size
                     res = api_post(self.api_settings, "/sdapi/v1/img2img", req)
@@ -3081,6 +3119,9 @@ class MainWindow(QMainWindow):
 
     def result_dir(self, job: JobData) -> Path:
         return self.job_dir(job.job_id) / RESULT_DIR_NAME
+
+    def debug_dir(self, job: JobData) -> Path:
+        return self.job_dir(job.job_id) / DEBUG_DIR_NAME
 
     def result_abs(self, job: JobData, rel_path: str) -> Path:
         return self.job_dir(job.job_id) / rel_path
