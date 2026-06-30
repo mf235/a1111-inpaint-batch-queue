@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 APP_TITLE = "A1111 Inpaint Batch Queue"
-APP_REV = "v23"
+APP_REV = "v24"
 SETTINGS_NAME = "a1111-inpaint-batch-queue-settings.json"
 PROJECT_FILE_NAME = "project.json"
 PROJECT_SETTINGS_NAME = "settings.json"
@@ -262,6 +262,7 @@ def numpy_rgba_to_png_base64(rgba: np.ndarray) -> str:
 
 MIN_CROP_SIZE = 8
 API_DIM_MULTIPLE = 8
+MIN_CROP_API_SIDE = 512
 
 
 def ceil_to_multiple(value: int, multiple: int = API_DIM_MULTIPLE) -> int:
@@ -353,7 +354,49 @@ def resized_for_api(rgba: np.ndarray, mask: np.ndarray, max_size_key: str, force
         new_w = min(max_w, floor_to_multiple(new_w))
         new_h = min(max_h, floor_to_multiple(new_h))
     rgba_out = cv2.resize(rgba.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-    mask_out = cv2.resize(mask.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+    mask_out = cv2.resize(mask.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+    return np.ascontiguousarray(rgba_out), np.ascontiguousarray(mask_out), True
+
+
+def resized_crop_for_api(rgba: np.ndarray, mask: np.ndarray, max_size_key: str) -> Tuple[np.ndarray, np.ndarray, bool]:
+    """Resize manual-crop inputs to a model-friendly size.
+
+    Sending tiny crop rectangles directly to Stable Diffusion tends to produce
+    broken/noisy inpaint patches. Manual crop is only the source region; the API
+    canvas still needs enough pixels for the model.
+    """
+    h, w = rgba.shape[:2]
+    if w <= 0 or h <= 0:
+        return rgba, mask, False
+
+    scale = 1.0
+    short_side = min(w, h)
+    if short_side < MIN_CROP_API_SIDE:
+        scale = max(scale, float(MIN_CROP_API_SIDE) / float(short_side))
+
+    limit = MAX_API_SIZE_OPTIONS.get(max_size_key)
+    max_w = max_h = None
+    if limit is not None:
+        max_w, max_h = int(limit[0]), int(limit[1])
+        limit_scale = min(float(max_w) / float(w), float(max_h) / float(h))
+        if limit_scale < scale:
+            scale = max(0.01, limit_scale)
+
+    raw_w = max(1, int(round(w * scale)))
+    raw_h = max(1, int(round(h * scale)))
+    new_w = ceil_to_multiple(raw_w)
+    new_h = ceil_to_multiple(raw_h)
+    if max_w is not None and new_w > max_w:
+        new_w = floor_to_multiple(max_w)
+    if max_h is not None and new_h > max_h:
+        new_h = floor_to_multiple(max_h)
+    new_w = max(API_DIM_MULTIPLE, int(new_w))
+    new_h = max(API_DIM_MULTIPLE, int(new_h))
+
+    if new_w == w and new_h == h:
+        return np.ascontiguousarray(rgba), np.ascontiguousarray(mask), False
+    rgba_out = cv2.resize(rgba.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+    mask_out = cv2.resize(mask.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_NEAREST)
     return np.ascontiguousarray(rgba_out), np.ascontiguousarray(mask_out), True
 
 
@@ -376,7 +419,7 @@ def prepare_image_pair_for_api(rgba: np.ndarray, mask: np.ndarray, crop_enabled:
     base_crop = np.ascontiguousarray(rgba[y:y+h, x:x+w])
     mask_crop = np.ascontiguousarray(mask[y:y+h, x:x+w])
     base_pad, mask_pad, padded_size = pad_pair_to_multiple(base_crop, mask_crop)
-    base_api, mask_api, _resized = resized_for_api(base_pad, mask_pad, max_size_key, force_multiple=True)
+    base_api, mask_api, _resized = resized_crop_for_api(base_pad, mask_pad, max_size_key)
     return ApiImagePrep(base_api, mask_api, api_rect, padded_size)
 
 
