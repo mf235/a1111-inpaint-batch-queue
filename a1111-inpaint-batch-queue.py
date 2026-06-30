@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 APP_TITLE = "A1111 Inpaint Batch Queue"
-APP_REV = "v27"
+APP_REV = "v28"
 SETTINGS_NAME = "a1111-inpaint-batch-queue-settings.json"
 PROJECT_FILE_NAME = "project.json"
 PROJECT_SETTINGS_NAME = "settings.json"
@@ -311,45 +311,45 @@ def crop_rect_from_drag_points_keep_anchor(
     current_y: float,
     image_size: Tuple[int, int],
 ) -> Optional[Tuple[int, int, int, int]]:
-    """Build a crop rectangle from a drag while keeping the mouse-down corner fixed.
+    """Build a manual crop rectangle from drag points.
 
-    Small crop rectangles are expanded at selection time, but only toward the
-    drag direction. The start point must not be recentered or shifted. If the
-    requested expansion would run outside the image, the size is clipped at the
-    image edge instead of moving the anchor corner.
+    The mouse-down point stays inside the selected crop.  Small selections are
+    expanded immediately to an API-safe minimum size.  When the preferred drag
+    direction hits an image edge, the rectangle expands back into the image
+    instead of collapsing into a thin strip.
     """
     img_w, img_h = int(image_size[0]), int(image_size[1])
     if img_w <= 0 or img_h <= 0:
         return None
 
-    sx = max(0.0, min(float(start_x), float(img_w)))
-    sy = max(0.0, min(float(start_y), float(img_h)))
-    cx = max(0.0, min(float(current_x), float(img_w)))
-    cy = max(0.0, min(float(current_y), float(img_h)))
+    def build_axis(start: float, current: float, limit: int) -> Tuple[int, int]:
+        s = max(0.0, min(float(start), float(limit)))
+        c = max(0.0, min(float(current), float(limit)))
+        raw_len = max(MIN_CROP_SIZE, int(math.ceil(abs(c - s))))
+        target = min(limit, max(ceil_to_multiple(raw_len), min(limit, MIN_CROP_API_SIDE)))
 
-    dir_x = -1 if cx < sx else 1
-    dir_y = -1 if cy < sy else 1
-    raw_w = max(MIN_CROP_SIZE, int(math.ceil(abs(cx - sx))))
-    raw_h = max(MIN_CROP_SIZE, int(math.ceil(abs(cy - sy))))
-    target_w = max(ceil_to_multiple(raw_w), min(img_w, MIN_CROP_API_SIDE))
-    target_h = max(ceil_to_multiple(raw_h), min(img_h, MIN_CROP_API_SIDE))
+        if c < s:
+            # Prefer expanding toward the drag direction, but if the image edge
+            # prevents the minimum size, keep the selection valid by growing
+            # back into the image.
+            high = int(math.ceil(s))
+            low = high - target
+            if low < 0:
+                low = 0
+                high = min(limit, target)
+        else:
+            low = int(math.floor(s))
+            high = low + target
+            if high > limit:
+                high = limit
+                low = max(0, high - target)
 
-    if dir_x >= 0:
-        x = int(math.floor(sx))
-        target_w = min(target_w, max(0, img_w - x))
-    else:
-        right = int(math.ceil(sx))
-        target_w = min(target_w, max(0, right))
-        x = right - target_w
+        low = max(0, min(int(low), limit))
+        high = max(low, min(int(high), limit))
+        return low, max(0, high - low)
 
-    if dir_y >= 0:
-        y = int(math.floor(sy))
-        target_h = min(target_h, max(0, img_h - y))
-    else:
-        bottom = int(math.ceil(sy))
-        target_h = min(target_h, max(0, bottom))
-        y = bottom - target_h
-
+    x, target_w = build_axis(start_x, current_x, img_w)
+    y, target_h = build_axis(start_y, current_y, img_h)
     return normalize_crop_rect_data((x, y, target_w, target_h), (img_w, img_h))
 
 
