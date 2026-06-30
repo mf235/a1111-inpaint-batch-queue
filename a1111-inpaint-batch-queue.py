@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 APP_TITLE = "A1111 Inpaint Batch Queue"
-APP_REV = "v26"
+APP_REV = "v27"
 SETTINGS_NAME = "a1111-inpaint-batch-queue-settings.json"
 PROJECT_FILE_NAME = "project.json"
 PROJECT_SETTINGS_NAME = "settings.json"
@@ -304,28 +304,53 @@ def normalize_crop_rect_data(rect: object, image_size: Optional[Tuple[int, int]]
     return int(x), int(y), int(w), int(h)
 
 
-def expand_crop_rect_for_selection(rect: Tuple[int, int, int, int], image_size: Tuple[int, int]) -> Tuple[int, int, int, int]:
-    """Expand the visible/saved crop rectangle at selection time.
+def crop_rect_from_drag_points_keep_anchor(
+    start_x: float,
+    start_y: float,
+    current_x: float,
+    current_y: float,
+    image_size: Tuple[int, int],
+) -> Optional[Tuple[int, int, int, int]]:
+    """Build a crop rectangle from a drag while keeping the mouse-down corner fixed.
 
-    Tiny Stable Diffusion canvases produce unstable inpaint results. The crop
-    rectangle shown to the user and saved in job.json should already be the real
-    API source region; do not secretly widen it later right before sending.
+    Small crop rectangles are expanded at selection time, but only toward the
+    drag direction. The start point must not be recentered or shifted. If the
+    requested expansion would run outside the image, the size is clipped at the
+    image edge instead of moving the anchor corner.
     """
     img_w, img_h = int(image_size[0]), int(image_size[1])
-    x, y, w, h = [int(v) for v in rect]
+    if img_w <= 0 or img_h <= 0:
+        return None
 
-    min_w = min(img_w, MIN_CROP_API_SIDE)
-    min_h = min(img_h, MIN_CROP_API_SIDE)
-    target_w = min(img_w, max(ceil_to_multiple(w), min_w))
-    target_h = min(img_h, max(ceil_to_multiple(h), min_h))
+    sx = max(0.0, min(float(start_x), float(img_w)))
+    sy = max(0.0, min(float(start_y), float(img_h)))
+    cx = max(0.0, min(float(current_x), float(img_w)))
+    cy = max(0.0, min(float(current_y), float(img_h)))
 
-    center_x = x + w / 2.0
-    center_y = y + h / 2.0
-    new_x = int(round(center_x - target_w / 2.0))
-    new_y = int(round(center_y - target_h / 2.0))
-    new_x = max(0, min(new_x, img_w - target_w))
-    new_y = max(0, min(new_y, img_h - target_h))
-    return normalize_crop_rect_data((new_x, new_y, target_w, target_h), (img_w, img_h)) or rect
+    dir_x = -1 if cx < sx else 1
+    dir_y = -1 if cy < sy else 1
+    raw_w = max(MIN_CROP_SIZE, int(math.ceil(abs(cx - sx))))
+    raw_h = max(MIN_CROP_SIZE, int(math.ceil(abs(cy - sy))))
+    target_w = max(ceil_to_multiple(raw_w), min(img_w, MIN_CROP_API_SIDE))
+    target_h = max(ceil_to_multiple(raw_h), min(img_h, MIN_CROP_API_SIDE))
+
+    if dir_x >= 0:
+        x = int(math.floor(sx))
+        target_w = min(target_w, max(0, img_w - x))
+    else:
+        right = int(math.ceil(sx))
+        target_w = min(target_w, max(0, right))
+        x = right - target_w
+
+    if dir_y >= 0:
+        y = int(math.floor(sy))
+        target_h = min(target_h, max(0, img_h - y))
+    else:
+        bottom = int(math.ceil(sy))
+        target_h = min(target_h, max(0, bottom))
+        y = bottom - target_h
+
+    return normalize_crop_rect_data((x, y, target_w, target_h), (img_w, img_h))
 
 
 def pad_pair_to_multiple(rgba: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
@@ -785,8 +810,6 @@ class MaskCanvas(QWidget):
     def set_crop_rect(self, rect: object, emit_signal: bool = True) -> None:
         size = (int(self.base_rgba.shape[1]), int(self.base_rgba.shape[0])) if self.base_rgba is not None else None
         norm = normalize_crop_rect_data(rect, size)
-        if norm is not None and size is not None:
-            norm = expand_crop_rect_for_selection(norm, size)
         self.crop_rect = norm
         self.crop_enabled = norm is not None
         self.crop_drawing = False
@@ -811,15 +834,7 @@ class MaskCanvas(QWidget):
         if self.base_rgba is None or p0 is None or p1 is None:
             return None
         h, w = self.base_rgba.shape[:2]
-        x0 = max(0.0, min(p0.x(), p1.x()))
-        y0 = max(0.0, min(p0.y(), p1.y()))
-        x1 = min(float(w), max(p0.x(), p1.x()))
-        y1 = min(float(h), max(p0.y(), p1.y()))
-        rect = (int(math.floor(x0)), int(math.floor(y0)), int(math.ceil(x1 - x0)), int(math.ceil(y1 - y0)))
-        norm = normalize_crop_rect_data(rect, (w, h))
-        if norm is not None:
-            norm = expand_crop_rect_for_selection(norm, (w, h))
-        return norm
+        return crop_rect_from_drag_points_keep_anchor(p0.x(), p0.y(), p1.x(), p1.y(), (w, h))
 
     def begin_crop(self, img_pos: QPointF) -> None:
         self.crop_drawing = True
