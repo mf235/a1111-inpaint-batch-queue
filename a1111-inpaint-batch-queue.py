@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 APP_TITLE = "A1111 Inpaint Batch Queue"
-APP_REV = "v17"
+APP_REV = "v18"
 SETTINGS_NAME = "a1111-inpaint-batch-queue-settings.json"
 PROJECT_FILE_NAME = "project.json"
 PROJECT_SETTINGS_NAME = "settings.json"
@@ -277,6 +277,56 @@ def resized_for_api(rgba: np.ndarray, mask: np.ndarray, max_size_key: str) -> Tu
     return np.ascontiguousarray(rgba_out), np.ascontiguousarray(mask_out), True
 
 
+MIN_CROP_SIZE = 8
+
+
+def normalize_crop_rect_data(rect: object, image_size: Optional[Tuple[int, int]] = None) -> Optional[Tuple[int, int, int, int]]:
+    if rect is None:
+        return None
+    x = y = w = h = None
+    if isinstance(rect, dict):
+        try:
+            x = int(rect.get("x", 0)); y = int(rect.get("y", 0)); w = int(rect.get("w", 0)); h = int(rect.get("h", 0))
+        except Exception:
+            return None
+    elif isinstance(rect, (list, tuple)) and len(rect) >= 4:
+        try:
+            x = int(rect[0]); y = int(rect[1]); w = int(rect[2]); h = int(rect[3])
+        except Exception:
+            return None
+    if x is None or y is None or w is None or h is None:
+        return None
+    if image_size is not None:
+        max_w, max_h = int(image_size[0]), int(image_size[1])
+        x = max(0, min(x, max_w))
+        y = max(0, min(y, max_h))
+        w = max(0, min(w, max_w - x))
+        h = max(0, min(h, max_h - y))
+    if w < MIN_CROP_SIZE or h < MIN_CROP_SIZE:
+        return None
+    return int(x), int(y), int(w), int(h)
+
+
+def crop_pair_for_api(rgba: np.ndarray, mask: np.ndarray, crop_enabled: bool, crop_rect: object) -> Tuple[np.ndarray, np.ndarray, Optional[Tuple[int, int, int, int]]]:
+    rect = normalize_crop_rect_data(crop_rect if crop_enabled else None, (int(rgba.shape[1]), int(rgba.shape[0])))
+    if rect is None:
+        return rgba, mask, None
+    x, y, w, h = rect
+    return np.ascontiguousarray(rgba[y:y+h, x:x+w]), np.ascontiguousarray(mask[y:y+h, x:x+w]), rect
+
+
+def composite_result_on_base(base_rgba: np.ndarray, result_rgba: np.ndarray, crop_rect: Optional[Tuple[int, int, int, int]]) -> np.ndarray:
+    if crop_rect is None:
+        return np.ascontiguousarray(result_rgba)
+    x, y, w, h = crop_rect
+    out = np.ascontiguousarray(base_rgba.copy())
+    patch = result_rgba
+    if patch.shape[:2] != (h, w):
+        patch = cv2.resize(patch.astype(np.uint8), (w, h), interpolation=cv2.INTER_LINEAR)
+    out[y:y+h, x:x+w] = patch[:, :, :4]
+    return out
+
+
 def prompt_text_for_api(text: str) -> str:
     """Remove prompt comment lines before sending to the API.
 
@@ -468,6 +518,8 @@ class JobData:
     checked: bool = True
     params: InpaintParams = field(default_factory=InpaintParams)
     latest_result: str = ""
+    crop_enabled: bool = False
+    crop_rect: Optional[Tuple[int, int, int, int]] = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -475,6 +527,10 @@ class JobData:
     def from_dict(cls, data: object) -> "JobData":
         if not isinstance(data, dict):
             raise ValueError("job.jsonが不正です。")
+        crop_enabled = bool(data.get("crop_enabled", False))
+        crop_rect = normalize_crop_rect_data(data.get("crop_rect"))
+        if crop_rect is None:
+            crop_enabled = False
         job = cls(
             job_id=str(data.get("job_id", "job_0000")),
             name=str(data.get("name", "Job")),
@@ -484,12 +540,16 @@ class JobData:
             checked=bool(data.get("checked", True)),
             params=InpaintParams.from_dict(data.get("params")),
             latest_result=str(data.get("latest_result", "")),
+            crop_enabled=crop_enabled,
+            crop_rect=crop_rect,
             created_at=float(data.get("created_at", time.time())),
             updated_at=float(data.get("updated_at", time.time())),
         )
         return job
 
     def to_dict(self) -> Dict[str, object]:
+        rect = self.crop_rect if self.crop_enabled else None
+        rect_dict = None if rect is None else {"x": int(rect[0]), "y": int(rect[1]), "w": int(rect[2]), "h": int(rect[3])}
         return {
             "job_id": self.job_id,
             "name": self.name,
@@ -499,6 +559,8 @@ class JobData:
             "checked": self.checked,
             "params": asdict(self.params),
             "latest_result": self.latest_result,
+            "crop_enabled": bool(self.crop_enabled and rect_dict is not None),
+            "crop_rect": rect_dict,
             "created_at": self.created_at,
             "updated_at": time.time(),
         }
@@ -506,6 +568,7 @@ class JobData:
 
 class MaskCanvas(QWidget):
     maskChanged = Signal()
+    cropChanged = Signal()
     toolChanged = Signal(str)
     zoomChanged = Signal(float)
     fileDropped = Signal(list)
@@ -542,6 +605,11 @@ class MaskCanvas(QWidget):
         self._live_draw_points: List[QPointF] = []
         self._live_draw_tool = "brush"
         self._live_draw_brush_size = self.brush_size
+        self.crop_enabled = False
+        self.crop_rect: Optional[Tuple[int, int, int, int]] = None
+        self.crop_drawing = False
+        self.crop_start_img: Optional[QPointF] = None
+        self.crop_current_img: Optional[QPointF] = None
 
     # ---------- data ----------
     def set_images(self, base_rgba: Optional[np.ndarray], mask: Optional[np.ndarray], result_rgba: Optional[np.ndarray] = None, fit: bool = True) -> None:
@@ -557,6 +625,8 @@ class MaskCanvas(QWidget):
             if result_rgba is not None and result_rgba.shape[:2] != (h, w):
                 result_rgba = cv2.resize(result_rgba, (w, h), interpolation=cv2.INTER_LINEAR)
             self.result_rgba = np.ascontiguousarray(result_rgba) if result_rgba is not None else None
+            self.crop_rect = normalize_crop_rect_data(self.crop_rect, (w, h))
+            self.crop_enabled = self.crop_rect is not None and bool(self.crop_enabled)
             self._mask_version += 1
             if fit or self.view_center is None:
                 QTimer.singleShot(0, self.fit_to_window)
@@ -568,6 +638,11 @@ class MaskCanvas(QWidget):
             self.result_rgba = None
             self._mask_version += 1
             self.view_center = None
+            self.crop_enabled = False
+            self.crop_rect = None
+            self.crop_drawing = False
+            self.crop_start_img = None
+            self.crop_current_img = None
             self.update()
 
     def set_result(self, result_rgba: Optional[np.ndarray]) -> None:
@@ -590,6 +665,66 @@ class MaskCanvas(QWidget):
         self._qimage_cache_key = None
         self._qimage_cache = None
         self._pixmap_cache = None
+
+    def get_crop_rect(self) -> Optional[Tuple[int, int, int, int]]:
+        if not self.crop_enabled or self.base_rgba is None:
+            return None
+        return normalize_crop_rect_data(self.crop_rect, (int(self.base_rgba.shape[1]), int(self.base_rgba.shape[0])))
+
+    def set_crop_rect(self, rect: object, emit_signal: bool = True) -> None:
+        size = (int(self.base_rgba.shape[1]), int(self.base_rgba.shape[0])) if self.base_rgba is not None else None
+        norm = normalize_crop_rect_data(rect, size)
+        self.crop_rect = norm
+        self.crop_enabled = norm is not None
+        self.crop_drawing = False
+        self.crop_start_img = None
+        self.crop_current_img = None
+        self.update()
+        if emit_signal:
+            self.cropChanged.emit()
+
+    def clear_crop_rect(self, emit_signal: bool = True) -> None:
+        changed = self.crop_enabled or self.crop_rect is not None or self.crop_drawing
+        self.crop_enabled = False
+        self.crop_rect = None
+        self.crop_drawing = False
+        self.crop_start_img = None
+        self.crop_current_img = None
+        self.update()
+        if changed and emit_signal:
+            self.cropChanged.emit()
+
+    def _crop_rect_from_points(self, p0: Optional[QPointF], p1: Optional[QPointF]) -> Optional[Tuple[int, int, int, int]]:
+        if self.base_rgba is None or p0 is None or p1 is None:
+            return None
+        h, w = self.base_rgba.shape[:2]
+        x0 = max(0.0, min(p0.x(), p1.x()))
+        y0 = max(0.0, min(p0.y(), p1.y()))
+        x1 = min(float(w), max(p0.x(), p1.x()))
+        y1 = min(float(h), max(p0.y(), p1.y()))
+        rect = (int(math.floor(x0)), int(math.floor(y0)), int(math.ceil(x1 - x0)), int(math.ceil(y1 - y0)))
+        return normalize_crop_rect_data(rect, (w, h))
+
+    def begin_crop(self, img_pos: QPointF) -> None:
+        self.crop_drawing = True
+        self.crop_start_img = QPointF(img_pos.x(), img_pos.y())
+        self.crop_current_img = QPointF(img_pos.x(), img_pos.y())
+        self.update()
+
+    def continue_crop(self, img_pos: QPointF) -> None:
+        if not self.crop_drawing:
+            return
+        self.crop_current_img = QPointF(img_pos.x(), img_pos.y())
+        self.update()
+
+    def end_crop(self) -> None:
+        if not self.crop_drawing:
+            return
+        rect = self._crop_rect_from_points(self.crop_start_img, self.crop_current_img)
+        self.crop_drawing = False
+        self.crop_start_img = None
+        self.crop_current_img = None
+        self.set_crop_rect(rect, emit_signal=True)
 
     # ---------- view math ----------
     def get_fit_scale(self) -> float:
@@ -789,6 +924,21 @@ class MaskCanvas(QWidget):
         if self.mode == "result" and self.result_rgba is None:
             painter.setPen(QColor(255, 230, 120))
             painter.drawText(12, 24, "最新結果なし")
+        active_crop = self._crop_rect_from_points(self.crop_start_img, self.crop_current_img) if self.crop_drawing else self.get_crop_rect()
+        if active_crop is not None:
+            x, y, cw, ch = active_crop
+            tl = self.image_to_view(QPointF(float(x), float(y)))
+            br = self.image_to_view(QPointF(float(x + cw), float(y + ch)))
+            if tl is not None and br is not None:
+                crop_rect_view = QRectF(tl, br).normalized()
+                pen_color = QColor(80, 220, 255, 220) if self.crop_drawing else QColor(255, 225, 70, 230)
+                painter.setPen(QPen(pen_color, 2.0, Qt.PenStyle.DashLine))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(crop_rect_view)
+                label_rect = QRectF(crop_rect_view.left() + 4, crop_rect_view.top() + 4, 72, 20)
+                painter.fillRect(label_rect, QColor(0, 0, 0, 140))
+                painter.setPen(QColor(255, 245, 160))
+                painter.drawText(label_rect.adjusted(4, 0, -4, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, "CROP")
         if self._live_draw_points:
             painter.save()
             img_rect = QRectF(
@@ -834,7 +984,7 @@ class MaskCanvas(QWidget):
 
     # ---------- brush ----------
     def set_tool(self, tool: str) -> None:
-        if tool not in {"brush", "eraser"}:
+        if tool not in {"brush", "eraser", "crop"}:
             tool = "brush"
         if self.tool != tool:
             self.tool = tool
@@ -957,7 +1107,10 @@ class MaskCanvas(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             img_pos = self.view_to_image(pos)
             if img_pos is not None:
-                self.begin_draw(img_pos)
+                if self.tool == "crop":
+                    self.begin_crop(img_pos)
+                else:
+                    self.begin_draw(img_pos)
                 event.accept()
                 return
         super().mousePressEvent(event)
@@ -980,6 +1133,10 @@ class MaskCanvas(QWidget):
             self.update()
             event.accept()
             return
+        if self.crop_drawing and img_pos is not None:
+            self.continue_crop(img_pos)
+            event.accept()
+            return
         if self.drawing and img_pos is not None:
             self.continue_draw(img_pos)
             event.accept()
@@ -989,6 +1146,10 @@ class MaskCanvas(QWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if self.crop_drawing and event.button() == Qt.MouseButton.LeftButton:
+            self.end_crop()
+            event.accept()
+            return
         if self.drawing and event.button() == Qt.MouseButton.LeftButton:
             self.end_draw()
             event.accept()
@@ -1016,6 +1177,15 @@ class MaskCanvas(QWidget):
             self.set_tool("eraser")
             event.accept()
             return
+        if key == Qt.Key.Key_3:
+            self.set_tool("crop")
+            event.accept()
+            return
+        if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            if self.crop_enabled or self.crop_rect is not None:
+                self.clear_crop_rect(emit_signal=True)
+                event.accept()
+                return
         if key == Qt.Key.Key_Space:
             self.space_down = True
             self.setCursor(Qt.CursorShape.OpenHandCursor)
@@ -1240,6 +1410,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(6, 6, 6, 6)
         self.canvas = MaskCanvas()
         self.canvas.maskChanged.connect(self.on_mask_changed)
+        self.canvas.cropChanged.connect(self.on_crop_changed)
         self.canvas.toolChanged.connect(self.on_canvas_tool_changed)
         self.canvas.fileDropped.connect(self.add_image_paths)
         layout.addWidget(self.canvas, 1)
@@ -1259,10 +1430,14 @@ class MainWindow(QMainWindow):
         self.brush_btn.setCheckable(True)
         self.eraser_btn = QPushButton("消しゴム [2]")
         self.eraser_btn.setCheckable(True)
+        self.crop_btn = QPushButton("クロップ [3]")
+        self.crop_btn.setCheckable(True)
         self.brush_btn.clicked.connect(lambda: self.canvas.set_tool("brush"))
         self.eraser_btn.clicked.connect(lambda: self.canvas.set_tool("eraser"))
+        self.crop_btn.clicked.connect(lambda: self.canvas.set_tool("crop"))
         row1.addWidget(self.brush_btn)
         row1.addWidget(self.eraser_btn)
+        row1.addWidget(self.crop_btn)
         self.brush_size_spin = QSpinBox()
         self.brush_size_spin.setRange(1, 500)
         self.brush_size_spin.setValue(48)
@@ -1275,19 +1450,25 @@ class MainWindow(QMainWindow):
         self.clear_mask_btn = QPushButton("マスク全消去")
         self.invert_mask_btn = QPushButton("反転")
         self.load_mask_btn = QPushButton("マスク読込")
+        self.clear_crop_btn = QPushButton("クロップ解除")
         self.fit_btn.clicked.connect(self.canvas.fit_to_window)
         self.actual_btn.clicked.connect(self.canvas.set_actual_size)
         self.clear_mask_btn.clicked.connect(self.canvas.clear_mask)
         self.invert_mask_btn.clicked.connect(self.canvas.invert_mask)
         self.load_mask_btn.clicked.connect(self.load_mask_dialog)
-        for b in [self.fit_btn, self.actual_btn, self.clear_mask_btn, self.invert_mask_btn, self.load_mask_btn]:
+        self.clear_crop_btn.clicked.connect(lambda: self.canvas.clear_crop_rect())
+        for b in [self.fit_btn, self.actual_btn, self.clear_mask_btn, self.invert_mask_btn, self.load_mask_btn, self.clear_crop_btn]:
             row1.addWidget(b)
         layout.addLayout(row1)
-        hint = QLabel("左ドラッグ: マスク描画 / 右ドラッグ: 表示移動 / ホイール: 拡大縮小 / Space+左ドラッグ: 表示移動")
+        hint = QLabel("左ドラッグ: ブラシ/消しゴム/クロップ / 右ドラッグ: 表示移動 / ホイール: 拡大縮小 / Space+左ドラッグ: 表示移動 / Delete: クロップ解除")
         hint.setStyleSheet("color: #666;")
         layout.addWidget(hint)
+        self.crop_info_label = QLabel("クロップ: 未設定")
+        self.crop_info_label.setStyleSheet("color: #666;")
+        layout.addWidget(self.crop_info_label)
         self.tabs.addTab(tab, "画像")
         self.on_canvas_tool_changed("brush")
+        self.update_crop_info_label()
 
     def _build_params_tab(self) -> None:
         tab = QWidget()
@@ -1413,7 +1594,9 @@ class MainWindow(QMainWindow):
         edit_menu = self.menuBar().addMenu("編集")
         brush_action = QAction("ブラシ", self); brush_action.triggered.connect(lambda: self.canvas.set_tool("brush"))
         eraser_action = QAction("消しゴム", self); eraser_action.triggered.connect(lambda: self.canvas.set_tool("eraser"))
-        edit_menu.addAction(brush_action); edit_menu.addAction(eraser_action)
+        crop_action = QAction("クロップ", self); crop_action.triggered.connect(lambda: self.canvas.set_tool("crop"))
+        clear_crop_action = QAction("クロップ解除", self); clear_crop_action.triggered.connect(lambda: self.canvas.clear_crop_rect())
+        edit_menu.addAction(brush_action); edit_menu.addAction(eraser_action); edit_menu.addAction(crop_action); edit_menu.addAction(clear_crop_action)
         view_menu = self.menuBar().addMenu("表示")
         fit_action = QAction("表示合わせ", self); fit_action.setShortcut("F"); fit_action.triggered.connect(self.canvas.fit_to_window)
         actual_action = QAction("100%", self); actual_action.setShortcut("Ctrl+1"); actual_action.triggered.connect(self.canvas.set_actual_size)
@@ -1841,6 +2024,8 @@ class MainWindow(QMainWindow):
                 self.prompt_edit.setPlainText("")
                 self.negative_edit.setPlainText("")
                 self.canvas.set_images(None, None, None)
+                self.canvas.clear_crop_rect(emit_signal=False)
+                self.update_crop_info_label()
                 self.refresh_display_combo(None, preferred_mode="overlay")
                 return
             self.job_name_edit.setText(job.name)
@@ -1859,6 +2044,8 @@ class MainWindow(QMainWindow):
             preferred_mode = self.current_display_mode()
             self.refresh_display_combo(job, preferred_mode=preferred_mode, select_rel=job.latest_result if preferred_mode == "result" else "")
             self.canvas.set_images(base, mask, result, fit=True)
+            self.canvas.set_crop_rect(job.crop_rect if job.crop_enabled else None, emit_signal=False)
+            self.update_crop_info_label()
             self.canvas.set_mode(self.current_display_mode())
         except Exception as exc:
             self.log(f"ジョブ読込失敗: {safe_exception_text(exc)}")
@@ -1894,6 +2081,9 @@ class MainWindow(QMainWindow):
             job.name = self.job_name_edit.text().strip() or job.job_id
             job.checked = bool(self.checked_box.isChecked())
             job.params = self.params_from_ui()
+            crop_rect = self.canvas.get_crop_rect()
+            job.crop_enabled = crop_rect is not None
+            job.crop_rect = crop_rect
             if self.canvas.mask is not None:
                 cv2_write_png_unicode(self.job_mask_abs(job), self.canvas.mask)
             self.save_job(job)
@@ -1925,10 +2115,27 @@ class MainWindow(QMainWindow):
             self.log(f"マスク保存失敗: {safe_exception_text(exc)}")
 
     def on_canvas_tool_changed(self, tool: str) -> None:
-        self.brush_btn.blockSignals(True); self.eraser_btn.blockSignals(True)
+        self.brush_btn.blockSignals(True); self.eraser_btn.blockSignals(True); self.crop_btn.blockSignals(True)
         self.brush_btn.setChecked(tool == "brush")
         self.eraser_btn.setChecked(tool == "eraser")
-        self.brush_btn.blockSignals(False); self.eraser_btn.blockSignals(False)
+        self.crop_btn.setChecked(tool == "crop")
+        self.brush_btn.blockSignals(False); self.eraser_btn.blockSignals(False); self.crop_btn.blockSignals(False)
+
+    def update_crop_info_label(self) -> None:
+        rect = self.canvas.get_crop_rect()
+        if rect is None:
+            self.crop_info_label.setText("クロップ: 未設定")
+            self.clear_crop_btn.setEnabled(False)
+        else:
+            x, y, w, h = rect
+            self.crop_info_label.setText(f"クロップ: x={x} y={y} w={w} h={h}")
+            self.clear_crop_btn.setEnabled(True)
+
+    def on_crop_changed(self) -> None:
+        self.update_crop_info_label()
+        job = self.current_job()
+        if job is not None:
+            job.status = "編集中"
 
     def load_mask_dialog(self) -> None:
         job = self.current_job()
@@ -1968,7 +2175,8 @@ class MainWindow(QMainWindow):
         mask_path = self.job_mask_abs(job)
         base = cv2_read_rgba_unicode(input_path)
         mask = cv2_read_mask_unicode(mask_path, (base.shape[1], base.shape[0])) if mask_path.exists() else np.zeros(base.shape[:2], dtype=np.uint8)
-        base_api, mask_api, _resized = resized_for_api(base, mask, self.api_max_size)
+        base_crop, mask_crop, _crop_rect = crop_pair_for_api(base, mask, job.crop_enabled, job.crop_rect)
+        base_api, mask_api, _resized = resized_for_api(base_crop, mask_crop, self.api_max_size)
         p = job.params
         w = p.width or int(base_api.shape[1])
         h = p.height or int(base_api.shape[0])
@@ -2058,6 +2266,8 @@ class MainWindow(QMainWindow):
                     self.ui_refresh_jobs()
                     req = self.build_request_for_job(job)
                     write_json_utf8(self.job_dir(job.job_id) / REQUEST_FILE_NAME, req)
+                    base_full = cv2_read_rgba_unicode(self.job_input_abs(job))
+                    crop_rect = normalize_crop_rect_data(job.crop_rect if job.crop_enabled else None, (int(base_full.shape[1]), int(base_full.shape[0])))
                     res = api_post(self.api_settings, "/sdapi/v1/img2img", req)
                     images = res.get("images", []) if isinstance(res, dict) else []
                     if not images:
@@ -2067,6 +2277,8 @@ class MainWindow(QMainWindow):
                     latest_rel = ""
                     for i, img_b64 in enumerate(images, 1):
                         rgba = decode_api_image_to_rgba(img_b64)
+                        if crop_rect is not None:
+                            rgba = composite_result_on_base(base_full, rgba, crop_rect)
                         out_path = out_dir / f"result_{int(time.time())}_{i:03d}.png"
                         cv2_write_png_unicode(out_path, rgba)
                         latest_rel = str(out_path.relative_to(self.job_dir(job.job_id))).replace("\\", "/")
