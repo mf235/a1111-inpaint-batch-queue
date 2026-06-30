@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 APP_TITLE = "A1111 Inpaint Batch Queue"
-APP_REV = "v35"
+APP_REV = "v36"
 SETTINGS_NAME = "a1111-inpaint-batch-queue-settings.json"
 PROJECT_FILE_NAME = "project.json"
 PROJECT_SETTINGS_NAME = "settings.json"
@@ -65,7 +65,7 @@ except Exception as exc:  # pragma: no cover
     raise
 
 try:
-    from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
+    from PySide6.QtCore import QByteArray, QFile, QMimeData, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, QUrl, Signal
     from PySide6.QtGui import QAction, QActionGroup, QColor, QDragEnterEvent, QDropEvent, QImage, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QShortcut, QWheelEvent, QTextCursor
     from PySide6.QtWidgets import (
         QApplication,
@@ -550,6 +550,52 @@ def open_path_in_explorer(path: Path, select_file: bool = False) -> None:
             subprocess.Popen(["xdg-open", str(target)])
     except Exception:
         pass
+
+
+def move_path_to_trash(path: Path) -> bool:
+    """Move a file to the OS trash/recycle bin without adding extra dependencies."""
+    path = Path(path)
+    if not path.exists():
+        return False
+    try:
+        result = QFile.moveToTrash(str(path))
+        if isinstance(result, tuple):
+            return bool(result[0])
+        return bool(result)
+    except Exception:
+        pass
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            FO_DELETE = 0x0003
+            FOF_ALLOWUNDO = 0x0040
+            FOF_NOCONFIRMATION = 0x0010
+            FOF_NOERRORUI = 0x0400
+            FOF_SILENT = 0x0004
+
+            class SHFILEOPSTRUCTW(ctypes.Structure):
+                _fields_ = [
+                    ("hwnd", wintypes.HWND),
+                    ("wFunc", wintypes.UINT),
+                    ("pFrom", wintypes.LPCWSTR),
+                    ("pTo", wintypes.LPCWSTR),
+                    ("fFlags", wintypes.USHORT),
+                    ("fAnyOperationsAborted", wintypes.BOOL),
+                    ("hNameMappings", wintypes.LPVOID),
+                    ("lpszProgressTitle", wintypes.LPCWSTR),
+                ]
+
+            op = SHFILEOPSTRUCTW()
+            op.wFunc = FO_DELETE
+            op.pFrom = str(path) + "\0\0"
+            op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT
+            ret = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+            return ret == 0 and not bool(op.fAnyOperationsAborted) and not path.exists()
+        except Exception:
+            return False
+    return False
 
 
 def decode_api_image_to_rgba(text_b64: str) -> np.ndarray:
@@ -2017,10 +2063,17 @@ class MainWindow(QMainWindow):
         self.result_combo.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.result_combo.currentIndexChanged.connect(self.on_result_combo_changed)
         self.result_open_btn = QPushButton("開く")
-        self.result_open_btn.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        self.result_copy_btn = QPushButton("コピー")
+        self.result_delete_btn = QPushButton("削除")
+        for b in [self.result_open_btn, self.result_copy_btn, self.result_delete_btn]:
+            b.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         self.result_open_btn.clicked.connect(self.open_selected_result_path)
+        self.result_copy_btn.clicked.connect(self.copy_selected_result_path)
+        self.result_delete_btn.clicked.connect(self.delete_selected_result_path)
         row.addWidget(self.result_combo, 0)
         row.addWidget(self.result_open_btn, 0)
+        row.addWidget(self.result_copy_btn, 0)
+        row.addWidget(self.result_delete_btn, 0)
         row.addStretch(1)
         layout.addLayout(row)
 
@@ -3264,6 +3317,58 @@ class MainWindow(QMainWindow):
         folder = self.result_dir(job)
         folder.mkdir(parents=True, exist_ok=True)
         open_path_in_explorer(folder, select_file=False)
+
+    def copy_selected_result_path(self) -> None:
+        path = self.selected_result_path()
+        if path is None:
+            QMessageBox.information(self, "コピー", "コピーする出力結果がありません。")
+            return
+        try:
+            mime = QMimeData()
+            mime.setUrls([QUrl.fromLocalFile(str(path))])
+            mime.setText(str(path))
+            # Windows Explorer uses this to treat the clipboard item as a file copy,
+            # not a move.  QMimeData URLs alone work in many apps, but this makes
+            # Explorer paste behavior explicit.
+            mime.setData('application/x-qt-windows-mime;value="Preferred DropEffect"', QByteArray(b"\x01\x00\x00\x00"))
+            QApplication.clipboard().setMimeData(mime)
+            self.log(f"出力結果コピー: {path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "コピー失敗", safe_exception_text(exc))
+
+    def delete_selected_result_path(self) -> None:
+        job = self.current_job()
+        path = self.selected_result_path()
+        if job is None or path is None:
+            QMessageBox.information(self, "削除", "削除する出力結果がありません。")
+            return
+        rel = self.result_item_data().get("rel", "")
+        reply = QMessageBox.question(
+            self,
+            "削除確認",
+            f"この出力結果をゴミ箱へ移動しますか？\n\n{path}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        old_index = self.result_combo.currentIndex()
+        try:
+            if not move_path_to_trash(path):
+                raise RuntimeError("ゴミ箱への移動に失敗しました。")
+            entries_after = self.result_entries(job)
+            select_rel = ""
+            if entries_after:
+                select_index = clamp_int(old_index, 0, len(entries_after) - 1)
+                select_rel = entries_after[select_index][0]
+            latest_path = self.job_latest_result_abs(job)
+            if job.latest_result == rel or latest_path is None or not latest_path.exists():
+                job.latest_result = entries_after[-1][0] if entries_after else ""
+                self.save_job(job)
+            self.refresh_result_combo(job, select_rel=select_rel or job.latest_result)
+            self.log(f"出力結果削除: {path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "削除失敗", safe_exception_text(exc))
 
     def result_combo_indexes(self) -> List[int]:
         indexes: List[int] = []
