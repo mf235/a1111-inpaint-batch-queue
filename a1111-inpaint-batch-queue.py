@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 APP_TITLE = "A1111 Inpaint Batch Queue"
-APP_REV = "v22"
+APP_REV = "v23"
 SETTINGS_NAME = "a1111-inpaint-batch-queue-settings.json"
 PROJECT_FILE_NAME = "project.json"
 PROJECT_SETTINGS_NAME = "settings.json"
@@ -260,25 +260,20 @@ def numpy_rgba_to_png_base64(rgba: np.ndarray) -> str:
     return base64.b64encode(buf.tobytes()).decode("ascii")
 
 
-def resized_for_api(rgba: np.ndarray, mask: np.ndarray, max_size_key: str) -> Tuple[np.ndarray, np.ndarray, bool]:
-    limit = MAX_API_SIZE_OPTIONS.get(max_size_key)
-    if limit is None:
-        return rgba, mask, False
-    max_w, max_h = limit
-    h, w = rgba.shape[:2]
-    if w <= 0 or h <= 0:
-        return rgba, mask, False
-    scale = min(float(max_w) / float(w), float(max_h) / float(h), 1.0)
-    if scale >= 0.999999:
-        return rgba, mask, False
-    new_w = max(1, int(round(w * scale)))
-    new_h = max(1, int(round(h * scale)))
-    rgba_out = cv2.resize(rgba.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-    mask_out = cv2.resize(mask.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-    return np.ascontiguousarray(rgba_out), np.ascontiguousarray(mask_out), True
-
-
 MIN_CROP_SIZE = 8
+API_DIM_MULTIPLE = 8
+
+
+def ceil_to_multiple(value: int, multiple: int = API_DIM_MULTIPLE) -> int:
+    value = max(1, int(value))
+    multiple = max(1, int(multiple))
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def floor_to_multiple(value: int, multiple: int = API_DIM_MULTIPLE) -> int:
+    value = max(1, int(value))
+    multiple = max(1, int(multiple))
+    return max(multiple, (value // multiple) * multiple)
 
 
 def normalize_crop_rect_data(rect: object, image_size: Optional[Tuple[int, int]] = None) -> Optional[Tuple[int, int, int, int]]:
@@ -308,23 +303,99 @@ def normalize_crop_rect_data(rect: object, image_size: Optional[Tuple[int, int]]
     return int(x), int(y), int(w), int(h)
 
 
-def crop_pair_for_api(rgba: np.ndarray, mask: np.ndarray, crop_enabled: bool, crop_rect: object) -> Tuple[np.ndarray, np.ndarray, Optional[Tuple[int, int, int, int]]]:
-    rect = normalize_crop_rect_data(crop_rect if crop_enabled else None, (int(rgba.shape[1]), int(rgba.shape[0])))
+def expand_crop_rect_for_api(rect: Tuple[int, int, int, int], image_size: Tuple[int, int]) -> Tuple[int, int, int, int]:
+    """Expand the user crop outward to API-friendly dimensions without losing the selected area."""
+    img_w, img_h = int(image_size[0]), int(image_size[1])
+    x, y, w, h = [int(v) for v in rect]
+    target_w = min(img_w, ceil_to_multiple(w))
+    target_h = min(img_h, ceil_to_multiple(h))
+    new_x = x - max(0, target_w - w) // 2
+    new_y = y - max(0, target_h - h) // 2
+    new_x = max(0, min(new_x, img_w - target_w))
+    new_y = max(0, min(new_y, img_h - target_h))
+    # Clamp again defensively; target_w/target_h may be the full image size near edges.
+    return normalize_crop_rect_data((new_x, new_y, target_w, target_h), (img_w, img_h)) or rect
+
+
+def pad_pair_to_multiple(rgba: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
+    h, w = rgba.shape[:2]
+    target_w = ceil_to_multiple(w)
+    target_h = ceil_to_multiple(h)
+    pad_right = max(0, target_w - w)
+    pad_bottom = max(0, target_h - h)
+    if pad_right == 0 and pad_bottom == 0:
+        return np.ascontiguousarray(rgba), np.ascontiguousarray(mask), (w, h)
+    rgba_pad = cv2.copyMakeBorder(
+        rgba.astype(np.uint8), 0, pad_bottom, 0, pad_right,
+        cv2.BORDER_REPLICATE
+    )
+    mask_pad = cv2.copyMakeBorder(
+        mask.astype(np.uint8), 0, pad_bottom, 0, pad_right,
+        cv2.BORDER_CONSTANT, value=0
+    )
+    return np.ascontiguousarray(rgba_pad), np.ascontiguousarray(mask_pad), (target_w, target_h)
+
+
+def resized_for_api(rgba: np.ndarray, mask: np.ndarray, max_size_key: str, force_multiple: bool = False) -> Tuple[np.ndarray, np.ndarray, bool]:
+    limit = MAX_API_SIZE_OPTIONS.get(max_size_key)
+    if limit is None:
+        return rgba, mask, False
+    max_w, max_h = limit
+    h, w = rgba.shape[:2]
+    if w <= 0 or h <= 0:
+        return rgba, mask, False
+    scale = min(float(max_w) / float(w), float(max_h) / float(h), 1.0)
+    if scale >= 0.999999:
+        return rgba, mask, False
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    if force_multiple:
+        new_w = min(max_w, floor_to_multiple(new_w))
+        new_h = min(max_h, floor_to_multiple(new_h))
+    rgba_out = cv2.resize(rgba.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+    mask_out = cv2.resize(mask.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+    return np.ascontiguousarray(rgba_out), np.ascontiguousarray(mask_out), True
+
+
+@dataclass(frozen=True)
+class ApiImagePrep:
+    base_api: np.ndarray
+    mask_api: np.ndarray
+    paste_rect: Optional[Tuple[int, int, int, int]]
+    paste_canvas_size: Optional[Tuple[int, int]]
+
+
+def prepare_image_pair_for_api(rgba: np.ndarray, mask: np.ndarray, crop_enabled: bool, crop_rect: object, max_size_key: str) -> ApiImagePrep:
+    image_size = (int(rgba.shape[1]), int(rgba.shape[0]))
+    rect = normalize_crop_rect_data(crop_rect if crop_enabled else None, image_size)
     if rect is None:
-        return rgba, mask, None
-    x, y, w, h = rect
-    return np.ascontiguousarray(rgba[y:y+h, x:x+w]), np.ascontiguousarray(mask[y:y+h, x:x+w]), rect
+        base_api, mask_api, _resized = resized_for_api(rgba, mask, max_size_key, force_multiple=False)
+        return ApiImagePrep(base_api, mask_api, None, None)
+    api_rect = expand_crop_rect_for_api(rect, image_size)
+    x, y, w, h = api_rect
+    base_crop = np.ascontiguousarray(rgba[y:y+h, x:x+w])
+    mask_crop = np.ascontiguousarray(mask[y:y+h, x:x+w])
+    base_pad, mask_pad, padded_size = pad_pair_to_multiple(base_crop, mask_crop)
+    base_api, mask_api, _resized = resized_for_api(base_pad, mask_pad, max_size_key, force_multiple=True)
+    return ApiImagePrep(base_api, mask_api, api_rect, padded_size)
 
 
-def composite_result_on_base(base_rgba: np.ndarray, result_rgba: np.ndarray, crop_rect: Optional[Tuple[int, int, int, int]]) -> np.ndarray:
+def composite_result_on_base(
+    base_rgba: np.ndarray,
+    result_rgba: np.ndarray,
+    crop_rect: Optional[Tuple[int, int, int, int]],
+    paste_canvas_size: Optional[Tuple[int, int]] = None,
+) -> np.ndarray:
     if crop_rect is None:
         return np.ascontiguousarray(result_rgba)
     x, y, w, h = crop_rect
     out = np.ascontiguousarray(base_rgba.copy())
     patch = result_rgba
-    if patch.shape[:2] != (h, w):
-        patch = cv2.resize(patch.astype(np.uint8), (w, h), interpolation=cv2.INTER_LINEAR)
-    out[y:y+h, x:x+w] = patch[:, :, :4]
+    target_w, target_h = paste_canvas_size or (w, h)
+    if patch.shape[:2] != (target_h, target_w):
+        patch = cv2.resize(patch.astype(np.uint8), (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+    patch = np.ascontiguousarray(patch[:h, :w, :4])
+    out[y:y+h, x:x+w] = patch
     return out
 
 
@@ -2333,11 +2404,16 @@ class MainWindow(QMainWindow):
         mask_path = self.job_mask_abs(job)
         base = cv2_read_rgba_unicode(input_path)
         mask = cv2_read_mask_unicode(mask_path, (base.shape[1], base.shape[0])) if mask_path.exists() else np.zeros(base.shape[:2], dtype=np.uint8)
-        base_crop, mask_crop, _crop_rect = crop_pair_for_api(base, mask, job.crop_enabled, job.crop_rect)
-        base_api, mask_api, _resized = resized_for_api(base_crop, mask_crop, self.api_max_size)
+        prep = prepare_image_pair_for_api(base, mask, job.crop_enabled, job.crop_rect, self.api_max_size)
+        base_api = prep.base_api
+        mask_api = prep.mask_api
         p = job.params
-        w = p.width or int(base_api.shape[1])
-        h = p.height or int(base_api.shape[0])
+        crop_active = prep.paste_rect is not None
+        # Manual crop sends an already-cropped image. Force request dimensions to the
+        # actual API image size and disable A1111's additional full-res crop to avoid
+        # width/height mismatches and double-crop corruption.
+        w = int(base_api.shape[1]) if crop_active else (p.width or int(base_api.shape[1]))
+        h = int(base_api.shape[0]) if crop_active else (p.height or int(base_api.shape[0]))
         req = {
             "init_images": [numpy_rgba_to_png_base64(base_api)],
             "mask": numpy_mask_to_png_base64(mask_api),
@@ -2348,7 +2424,7 @@ class MainWindow(QMainWindow):
             "cfg_scale": p.cfg_scale,
             "denoising_strength": p.denoising_strength,
             "mask_blur": p.mask_blur,
-            "inpaint_full_res": p.inpaint_full_res,
+            "inpaint_full_res": False if crop_active else p.inpaint_full_res,
             "inpaint_full_res_padding": p.inpaint_full_res_padding,
             "inpainting_fill": p.inpainting_fill,
             "inpainting_mask_invert": p.inpainting_mask_invert,
@@ -2425,7 +2501,11 @@ class MainWindow(QMainWindow):
                     req = self.build_request_for_job(job)
                     write_json_utf8(self.job_dir(job.job_id) / REQUEST_FILE_NAME, req)
                     base_full = cv2_read_rgba_unicode(self.job_input_abs(job))
-                    crop_rect = normalize_crop_rect_data(job.crop_rect if job.crop_enabled else None, (int(base_full.shape[1]), int(base_full.shape[0])))
+                    mask_full_path = self.job_mask_abs(job)
+                    mask_full = cv2_read_mask_unicode(mask_full_path, (base_full.shape[1], base_full.shape[0])) if mask_full_path.exists() else np.zeros(base_full.shape[:2], dtype=np.uint8)
+                    prep = prepare_image_pair_for_api(base_full, mask_full, job.crop_enabled, job.crop_rect, self.api_max_size)
+                    crop_rect = prep.paste_rect
+                    paste_canvas_size = prep.paste_canvas_size
                     res = api_post(self.api_settings, "/sdapi/v1/img2img", req)
                     images = res.get("images", []) if isinstance(res, dict) else []
                     if not images:
@@ -2436,7 +2516,7 @@ class MainWindow(QMainWindow):
                     for i, img_b64 in enumerate(images, 1):
                         rgba = decode_api_image_to_rgba(img_b64)
                         if crop_rect is not None:
-                            rgba = composite_result_on_base(base_full, rgba, crop_rect)
+                            rgba = composite_result_on_base(base_full, rgba, crop_rect, paste_canvas_size)
                         out_path = out_dir / f"result_{int(time.time())}_{i:03d}.png"
                         cv2_write_png_unicode(out_path, rgba)
                         latest_rel = str(out_path.relative_to(self.job_dir(job.job_id))).replace("\\", "/")
