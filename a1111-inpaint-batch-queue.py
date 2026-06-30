@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 APP_TITLE = "A1111 Inpaint Batch Queue"
-APP_REV = "v19"
+APP_REV = "v20"
 SETTINGS_NAME = "a1111-inpaint-batch-queue-settings.json"
 PROJECT_FILE_NAME = "project.json"
 PROJECT_SETTINGS_NAME = "settings.json"
@@ -84,6 +84,7 @@ try:
         QMainWindow,
         QMessageBox,
         QPushButton,
+        QScrollArea,
         QSpinBox,
         QDoubleSpinBox,
         QSplitter,
@@ -1313,6 +1314,22 @@ def api_post(settings: ApiSettings, path: str, payload: dict) -> object:
     return api_request(settings, "POST", path, payload)
 
 
+def set_widget_can_shrink(widget: QWidget) -> None:
+    try:
+        widget.setMinimumWidth(0)
+        widget.setSizePolicy(QSizePolicy.Policy.Ignored, widget.sizePolicy().verticalPolicy())
+    except Exception:
+        pass
+
+
+def make_bold_label(text: str) -> QLabel:
+    label = QLabel(text)
+    font = label.font()
+    font.setBold(True)
+    label.setFont(font)
+    return label
+
+
 class MainWindow(QMainWindow):
     logSignal = Signal(str)
     progressSignal = Signal(str)
@@ -1329,6 +1346,7 @@ class MainWindow(QMainWindow):
         self.current_job_index: Optional[int] = None
         self.api_settings = ApiSettings()
         self.api_max_size = "unlimited"
+        self.ui_font_point_size = self._initial_ui_font_point_size()
         self.param_presets: Dict[str, Dict[str, object]] = sanitize_param_presets(None)
         self.loading_ui = True
         self._refreshing_job_list = False
@@ -1354,22 +1372,71 @@ class MainWindow(QMainWindow):
         self.loading_ui = False
         self.log(f"起動: {APP_TITLE} {APP_REV}")
 
+    def _initial_ui_font_point_size(self) -> int:
+        try:
+            size = QApplication.instance().font().pointSize()
+        except Exception:
+            size = 10
+        if size <= 0:
+            size = 10
+        return clamp_int(size, 9, 25)
+
+    def _sync_text_area_heights(self) -> None:
+        try:
+            if hasattr(self, "prompt_edit"):
+                prompt_h = self.prompt_edit.fontMetrics().lineSpacing() * 4 + 24
+                self.prompt_edit.setMinimumHeight(prompt_h)
+                self.prompt_edit.setMaximumHeight(prompt_h + 16)
+            if hasattr(self, "negative_edit"):
+                neg_h = self.negative_edit.fontMetrics().lineSpacing() * 2 + 18
+                self.negative_edit.setMinimumHeight(neg_h)
+                self.negative_edit.setMaximumHeight(neg_h + 8)
+        except Exception:
+            pass
+
+    def apply_ui_font_size(self, point_size: int, save: bool = True, log_change: bool = True) -> None:
+        point_size = clamp_int(point_size, 9, 25)
+        self.ui_font_point_size = point_size
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                font = app.font()
+                font.setPointSize(point_size)
+                app.setFont(font)
+                self.setFont(font)
+        except Exception:
+            pass
+        self._sync_text_area_heights()
+        self.sync_font_size_actions()
+        if save:
+            self._save_app_settings()
+        if log_change:
+            self.log(f"文字サイズ: {point_size}pt")
+
     # ---------- UI ----------
     def _build_ui(self) -> None:
         central = QWidget()
         root = QVBoxLayout(central)
         root.setContentsMargins(6, 6, 6, 6)
+        self.setMinimumSize(720, 520)
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setChildrenCollapsible(False)
         root.addWidget(self.splitter, 1)
         self.setCentralWidget(central)
 
         # left jobs
         left = QWidget()
+        left.setMinimumWidth(150)
+        left.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(4, 4, 4, 4)
         left_layout.setSpacing(6)
-        left_layout.addWidget(QLabel("ジョブ一覧（画像D&Dで追加）"))
+        job_list_title = QLabel("ジョブ一覧（画像D&Dで追加）")
+        set_widget_can_shrink(job_list_title)
+        left_layout.addWidget(job_list_title)
         self.job_list = QListWidget()
+        self.job_list.setMinimumWidth(0)
+        self.job_list.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self.job_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.job_list.currentRowChanged.connect(self.on_job_selected)
         left_layout.addWidget(self.job_list, 1)
@@ -1385,15 +1452,20 @@ class MainWindow(QMainWindow):
         self.down_btn.clicked.connect(lambda: self.move_job(1))
         self.check_btn.clicked.connect(self.toggle_current_checked)
         for b in [self.add_btn, self.remove_btn, self.up_btn, self.down_btn, self.check_btn]:
+            set_widget_can_shrink(b)
             job_btns1.addWidget(b)
         left_layout.addLayout(job_btns1)
         self.splitter.addWidget(left)
 
         # right tabs
         right = QWidget()
+        right.setMinimumWidth(300)
+        right.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(4, 4, 4, 4)
         self.tabs = QTabWidget()
+        self.tabs.setMinimumWidth(0)
+        self.tabs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         right_layout.addWidget(self.tabs, 1)
         self.splitter.addWidget(right)
         self.splitter.setStretchFactor(0, 0)
@@ -1418,9 +1490,11 @@ class MainWindow(QMainWindow):
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("表示"))
         self.mode_combo = QComboBox()
-        self.mode_combo.setMinimumWidth(170)
+        self.mode_combo.setMinimumWidth(90)
+        set_widget_can_shrink(self.mode_combo)
         self.mode_combo.currentIndexChanged.connect(self.on_display_combo_changed)
         self.open_result_btn = QPushButton("開く")
+        set_widget_can_shrink(self.open_result_btn)
         self.open_result_btn.clicked.connect(self.open_selected_result_path)
         row1.addWidget(self.mode_combo)
         row1.addWidget(self.open_result_btn)
@@ -1435,12 +1509,15 @@ class MainWindow(QMainWindow):
         self.brush_btn.clicked.connect(lambda: self.canvas.set_tool("brush"))
         self.eraser_btn.clicked.connect(lambda: self.canvas.set_tool("eraser"))
         self.crop_btn.clicked.connect(lambda: self.canvas.set_tool("crop"))
+        for b in [self.brush_btn, self.eraser_btn, self.crop_btn]:
+            set_widget_can_shrink(b)
         row1.addWidget(self.brush_btn)
         row1.addWidget(self.eraser_btn)
         row1.addWidget(self.crop_btn)
         self.brush_size_spin = QSpinBox()
         self.brush_size_spin.setRange(1, 500)
         self.brush_size_spin.setValue(48)
+        self.brush_size_spin.setMinimumWidth(60)
         self.brush_size_spin.valueChanged.connect(self.canvas.set_brush_size)
         row1.addWidget(QLabel("サイズ"))
         row1.addWidget(self.brush_size_spin)
@@ -1458,6 +1535,7 @@ class MainWindow(QMainWindow):
         self.load_mask_btn.clicked.connect(self.load_mask_dialog)
         self.clear_crop_btn.clicked.connect(lambda: self.canvas.clear_crop_rect())
         for b in [self.fit_btn, self.actual_btn, self.clear_mask_btn, self.invert_mask_btn, self.load_mask_btn, self.clear_crop_btn]:
+            set_widget_can_shrink(b)
             row1.addWidget(b)
         layout.addLayout(row1)
         hint = QLabel("左ドラッグ: ブラシ/消しゴム/クロップ / 右ドラッグ: 表示移動 / ホイール: 拡大縮小 / Space+左ドラッグ: 表示移動 / Delete: クロップ解除")
@@ -1472,11 +1550,21 @@ class MainWindow(QMainWindow):
 
     def _build_params_tab(self) -> None:
         tab = QWidget()
-        root = QVBoxLayout(tab)
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setMinimumSize(0, 0)
+        scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+        content = QWidget()
+        content.setMinimumWidth(0)
+        content.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        root = QVBoxLayout(content)
         root.setContentsMargins(8, 8, 8, 8)
         name_row = QHBoxLayout()
-        name_row.addWidget(QLabel("ジョブ名"))
+        name_row.addWidget(make_bold_label("ジョブ名"))
         self.job_name_edit = QLineEdit()
+        set_widget_can_shrink(self.job_name_edit)
         self.job_name_edit.editingFinished.connect(self.save_current_job_from_ui)
         name_row.addWidget(self.job_name_edit, 1)
         self.checked_box = QCheckBox("一括実行対象")
@@ -1485,15 +1573,18 @@ class MainWindow(QMainWindow):
         root.addLayout(name_row)
 
         preset_row = QHBoxLayout()
-        preset_row.addWidget(QLabel("プリセット"))
+        preset_row.addWidget(make_bold_label("プリセット"))
         self.preset_combo = QComboBox()
         self.preset_combo.setEditable(True)
         no_insert = getattr(getattr(QComboBox, "InsertPolicy", QComboBox), "NoInsert")
         self.preset_combo.setInsertPolicy(no_insert)
-        self.preset_combo.setMinimumWidth(260)
+        self.preset_combo.setMinimumWidth(120)
+        set_widget_can_shrink(self.preset_combo)
         self.preset_combo.activated.connect(self.on_preset_activated)
         self.preset_new_btn = QPushButton("New")
         self.preset_del_btn = QPushButton("Del")
+        set_widget_can_shrink(self.preset_new_btn)
+        set_widget_can_shrink(self.preset_del_btn)
         self.preset_new_btn.clicked.connect(self.new_param_preset_from_current)
         self.preset_del_btn.clicked.connect(self.delete_current_param_preset)
         preset_row.addWidget(self.preset_combo, 1)
@@ -1504,16 +1595,14 @@ class MainWindow(QMainWindow):
 
         self.prompt_edit = QTextEdit()
         self.prompt_edit.setPlaceholderText("Prompt")
-        self.prompt_edit.setMinimumHeight(78)
-        self.prompt_edit.setMaximumHeight(96)
+        set_widget_can_shrink(self.prompt_edit)
         self.negative_edit = QTextEdit()
         self.negative_edit.setPlaceholderText("Negative Prompt")
-        neg_h = self.negative_edit.fontMetrics().lineSpacing() * 2 + 18
-        self.negative_edit.setMinimumHeight(neg_h)
-        self.negative_edit.setMaximumHeight(neg_h + 8)
-        root.addWidget(QLabel("Prompt"))
+        set_widget_can_shrink(self.negative_edit)
+        self._sync_text_area_heights()
+        root.addWidget(make_bold_label("Prompt"))
         root.addWidget(self.prompt_edit)
-        root.addWidget(QLabel("Negative Prompt"))
+        root.addWidget(make_bold_label("Negative Prompt"))
         root.addWidget(self.negative_edit)
 
         self.sampler_edit = QLineEdit("Euler a")
@@ -1527,6 +1616,12 @@ class MainWindow(QMainWindow):
         self.batch_spin = QSpinBox(); self.batch_spin.setRange(1, 16); self.batch_spin.setValue(1)
         self.niter_spin = QSpinBox(); self.niter_spin.setRange(1, 100); self.niter_spin.setValue(4)
         self.seed_spin = QSpinBox(); self.seed_spin.setRange(-1, 2147483647); self.seed_spin.setValue(-1)
+        for widget in [
+            self.sampler_edit, self.steps_spin, self.cfg_spin, self.denoise_spin,
+            self.mask_blur_spin, self.padding_spin, self.fill_combo, self.full_res_check,
+            self.batch_spin, self.niter_spin, self.seed_spin, self.checked_box,
+        ]:
+            set_widget_can_shrink(widget)
 
         param_column = QVBoxLayout()
         param_column.setSpacing(6)
@@ -1545,7 +1640,7 @@ class MainWindow(QMainWindow):
         ]
         for label_text, widget, description in param_descriptions:
             field_row = QHBoxLayout()
-            label = QLabel(label_text)
+            label = make_bold_label(label_text)
             label.setMinimumWidth(120)
             field_row.addWidget(label)
             field_row.addWidget(widget, 1)
@@ -1557,9 +1652,12 @@ class MainWindow(QMainWindow):
         root.addLayout(param_column)
         self.save_job_btn = QPushButton("現在のジョブを保存")
         self.save_job_btn.setToolTip("ジョブ名、プロンプト、パラメータ、現在のマスクを job.json / mask.png に保存します。")
+        set_widget_can_shrink(self.save_job_btn)
         self.save_job_btn.clicked.connect(self.save_current_job_from_ui)
         root.addWidget(self.save_job_btn, 0, Qt.AlignmentFlag.AlignRight)
         root.addStretch(1)
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
         self.tabs.addTab(tab, "パラメータ")
 
     def _build_run_tab(self) -> None:
@@ -1582,6 +1680,7 @@ class MainWindow(QMainWindow):
         self.run_failed_btn.clicked.connect(self.run_failed_jobs)
         self.stop_btn.clicked.connect(self.request_stop)
         for b in [self.api_btn, self.test_btn, self.dry_btn, self.run_current_btn, self.run_checked_btn, self.run_failed_btn, self.stop_btn]:
+            set_widget_can_shrink(b)
             row.addWidget(b)
         row.addStretch(1)
         root.addLayout(row)
@@ -1633,6 +1732,19 @@ class MainWindow(QMainWindow):
             max_menu.addAction(action)
         self.sync_max_size_actions()
 
+        font_menu = settings_menu.addMenu("文字サイズ")
+        self.font_size_action_group = QActionGroup(self)
+        self.font_size_action_group.setExclusive(True)
+        self.font_size_actions: Dict[int, QAction] = {}
+        for point_size in range(9, 26):
+            action = QAction(f"{point_size}pt", self)
+            action.setCheckable(True)
+            action.triggered.connect(lambda checked=False, s=point_size: self.apply_ui_font_size(s))
+            self.font_size_action_group.addAction(action)
+            self.font_size_actions[point_size] = action
+            font_menu.addAction(action)
+        self.sync_font_size_actions()
+
     def set_api_max_size(self, key: str) -> None:
         if key not in MAX_API_SIZE_OPTIONS:
             key = "unlimited"
@@ -1649,6 +1761,14 @@ class MainWindow(QMainWindow):
         for action_key, action in actions.items():
             action.blockSignals(True)
             action.setChecked(action_key == key)
+            action.blockSignals(False)
+
+    def sync_font_size_actions(self) -> None:
+        actions = getattr(self, "font_size_actions", {})
+        size = clamp_int(getattr(self, "ui_font_point_size", self._initial_ui_font_point_size()), 9, 25)
+        for point_size, action in actions.items():
+            action.blockSignals(True)
+            action.setChecked(point_size == size)
             action.blockSignals(False)
 
     # ---------- parameter presets ----------
@@ -1748,6 +1868,10 @@ class MainWindow(QMainWindow):
         max_size = str(data.get("max_api_size", "unlimited"))
         self.api_max_size = max_size if max_size in MAX_API_SIZE_OPTIONS else "unlimited"
         self.sync_max_size_actions()
+        try:
+            self.apply_ui_font_size(int(data.get("ui_font_point_size", self.ui_font_point_size)), save=False, log_change=False)
+        except Exception:
+            self.apply_ui_font_size(self.ui_font_point_size, save=False, log_change=False)
         proj = str(data.get("last_project", "")).strip()
         if proj:
             self.project_dir = Path(proj)
@@ -1787,6 +1911,7 @@ class MainWindow(QMainWindow):
                 "last_project": str(self.project_dir),
                 "api": self.api_settings.to_dict(),
                 "max_api_size": self.api_max_size,
+                "ui_font_point_size": self.ui_font_point_size,
                 "param_presets": self.param_presets,
                 "window": {
                     "normal_geometry": {"x": geom.x(), "y": geom.y(), "width": geom.width(), "height": geom.height()},
