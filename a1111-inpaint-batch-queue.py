@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 APP_TITLE = "A1111 Inpaint Batch Queue"
-APP_REV = "v24"
+APP_REV = "v26"
 SETTINGS_NAME = "a1111-inpaint-batch-queue-settings.json"
 PROJECT_FILE_NAME = "project.json"
 PROJECT_SETTINGS_NAME = "settings.json"
@@ -304,17 +304,27 @@ def normalize_crop_rect_data(rect: object, image_size: Optional[Tuple[int, int]]
     return int(x), int(y), int(w), int(h)
 
 
-def expand_crop_rect_for_api(rect: Tuple[int, int, int, int], image_size: Tuple[int, int]) -> Tuple[int, int, int, int]:
-    """Expand the user crop outward to API-friendly dimensions without losing the selected area."""
+def expand_crop_rect_for_selection(rect: Tuple[int, int, int, int], image_size: Tuple[int, int]) -> Tuple[int, int, int, int]:
+    """Expand the visible/saved crop rectangle at selection time.
+
+    Tiny Stable Diffusion canvases produce unstable inpaint results. The crop
+    rectangle shown to the user and saved in job.json should already be the real
+    API source region; do not secretly widen it later right before sending.
+    """
     img_w, img_h = int(image_size[0]), int(image_size[1])
     x, y, w, h = [int(v) for v in rect]
-    target_w = min(img_w, ceil_to_multiple(w))
-    target_h = min(img_h, ceil_to_multiple(h))
-    new_x = x - max(0, target_w - w) // 2
-    new_y = y - max(0, target_h - h) // 2
+
+    min_w = min(img_w, MIN_CROP_API_SIDE)
+    min_h = min(img_h, MIN_CROP_API_SIDE)
+    target_w = min(img_w, max(ceil_to_multiple(w), min_w))
+    target_h = min(img_h, max(ceil_to_multiple(h), min_h))
+
+    center_x = x + w / 2.0
+    center_y = y + h / 2.0
+    new_x = int(round(center_x - target_w / 2.0))
+    new_y = int(round(center_y - target_h / 2.0))
     new_x = max(0, min(new_x, img_w - target_w))
     new_y = max(0, min(new_y, img_h - target_h))
-    # Clamp again defensively; target_w/target_h may be the full image size near edges.
     return normalize_crop_rect_data((new_x, new_y, target_w, target_h), (img_w, img_h)) or rect
 
 
@@ -359,45 +369,12 @@ def resized_for_api(rgba: np.ndarray, mask: np.ndarray, max_size_key: str, force
 
 
 def resized_crop_for_api(rgba: np.ndarray, mask: np.ndarray, max_size_key: str) -> Tuple[np.ndarray, np.ndarray, bool]:
-    """Resize manual-crop inputs to a model-friendly size.
+    """Downscale manual-crop inputs only when the API max-size setting requires it.
 
-    Sending tiny crop rectangles directly to Stable Diffusion tends to produce
-    broken/noisy inpaint patches. Manual crop is only the source region; the API
-    canvas still needs enough pixels for the model.
+    Do not upscale tiny crops here. Small crop areas are handled by expanding the
+    visible/saved crop rectangle at selection time.
     """
-    h, w = rgba.shape[:2]
-    if w <= 0 or h <= 0:
-        return rgba, mask, False
-
-    scale = 1.0
-    short_side = min(w, h)
-    if short_side < MIN_CROP_API_SIDE:
-        scale = max(scale, float(MIN_CROP_API_SIDE) / float(short_side))
-
-    limit = MAX_API_SIZE_OPTIONS.get(max_size_key)
-    max_w = max_h = None
-    if limit is not None:
-        max_w, max_h = int(limit[0]), int(limit[1])
-        limit_scale = min(float(max_w) / float(w), float(max_h) / float(h))
-        if limit_scale < scale:
-            scale = max(0.01, limit_scale)
-
-    raw_w = max(1, int(round(w * scale)))
-    raw_h = max(1, int(round(h * scale)))
-    new_w = ceil_to_multiple(raw_w)
-    new_h = ceil_to_multiple(raw_h)
-    if max_w is not None and new_w > max_w:
-        new_w = floor_to_multiple(max_w)
-    if max_h is not None and new_h > max_h:
-        new_h = floor_to_multiple(max_h)
-    new_w = max(API_DIM_MULTIPLE, int(new_w))
-    new_h = max(API_DIM_MULTIPLE, int(new_h))
-
-    if new_w == w and new_h == h:
-        return np.ascontiguousarray(rgba), np.ascontiguousarray(mask), False
-    rgba_out = cv2.resize(rgba.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-    mask_out = cv2.resize(mask.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_NEAREST)
-    return np.ascontiguousarray(rgba_out), np.ascontiguousarray(mask_out), True
+    return resized_for_api(rgba, mask, max_size_key, force_multiple=True)
 
 
 @dataclass(frozen=True)
@@ -414,7 +391,7 @@ def prepare_image_pair_for_api(rgba: np.ndarray, mask: np.ndarray, crop_enabled:
     if rect is None:
         base_api, mask_api, _resized = resized_for_api(rgba, mask, max_size_key, force_multiple=False)
         return ApiImagePrep(base_api, mask_api, None, None)
-    api_rect = expand_crop_rect_for_api(rect, image_size)
+    api_rect = rect
     x, y, w, h = api_rect
     base_crop = np.ascontiguousarray(rgba[y:y+h, x:x+w])
     mask_crop = np.ascontiguousarray(mask[y:y+h, x:x+w])
@@ -428,6 +405,8 @@ def composite_result_on_base(
     result_rgba: np.ndarray,
     crop_rect: Optional[Tuple[int, int, int, int]],
     paste_canvas_size: Optional[Tuple[int, int]] = None,
+    paste_mask: Optional[np.ndarray] = None,
+    mask_blur: int = 0,
 ) -> np.ndarray:
     if crop_rect is None:
         return np.ascontiguousarray(result_rgba)
@@ -437,8 +416,25 @@ def composite_result_on_base(
     target_w, target_h = paste_canvas_size or (w, h)
     if patch.shape[:2] != (target_h, target_w):
         patch = cv2.resize(patch.astype(np.uint8), (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-    patch = np.ascontiguousarray(patch[:h, :w, :4])
-    out[y:y+h, x:x+w] = patch
+    patch = np.ascontiguousarray(patch[:h, :w, :4].astype(np.uint8))
+
+    if paste_mask is not None:
+        mask_crop = np.ascontiguousarray(paste_mask[y:y+h, x:x+w].astype(np.uint8))
+        if mask_crop.shape[:2] != (h, w):
+            mask_crop = cv2.resize(mask_crop, (w, h), interpolation=cv2.INTER_NEAREST)
+        if int(mask_crop.max()) <= 0:
+            return out
+        blur = max(0, int(mask_blur))
+        if blur > 0:
+            kernel = blur * 2 + 1
+            mask_crop = cv2.GaussianBlur(mask_crop, (kernel, kernel), 0)
+        alpha = (mask_crop.astype(np.float32) / 255.0)[:, :, None]
+        base_crop = out[y:y+h, x:x+w, :4].astype(np.float32)
+        patch_f = patch.astype(np.float32)
+        mixed = patch_f * alpha + base_crop * (1.0 - alpha)
+        out[y:y+h, x:x+w, :4] = np.clip(mixed, 0, 255).astype(np.uint8)
+    else:
+        out[y:y+h, x:x+w] = patch
     return out
 
 
@@ -789,6 +785,8 @@ class MaskCanvas(QWidget):
     def set_crop_rect(self, rect: object, emit_signal: bool = True) -> None:
         size = (int(self.base_rgba.shape[1]), int(self.base_rgba.shape[0])) if self.base_rgba is not None else None
         norm = normalize_crop_rect_data(rect, size)
+        if norm is not None and size is not None:
+            norm = expand_crop_rect_for_selection(norm, size)
         self.crop_rect = norm
         self.crop_enabled = norm is not None
         self.crop_drawing = False
@@ -818,7 +816,10 @@ class MaskCanvas(QWidget):
         x1 = min(float(w), max(p0.x(), p1.x()))
         y1 = min(float(h), max(p0.y(), p1.y()))
         rect = (int(math.floor(x0)), int(math.floor(y0)), int(math.ceil(x1 - x0)), int(math.ceil(y1 - y0)))
-        return normalize_crop_rect_data(rect, (w, h))
+        norm = normalize_crop_rect_data(rect, (w, h))
+        if norm is not None:
+            norm = expand_crop_rect_for_selection(norm, (w, h))
+        return norm
 
     def begin_crop(self, img_pos: QPointF) -> None:
         self.crop_drawing = True
@@ -2559,7 +2560,10 @@ class MainWindow(QMainWindow):
                     for i, img_b64 in enumerate(images, 1):
                         rgba = decode_api_image_to_rgba(img_b64)
                         if crop_rect is not None:
-                            rgba = composite_result_on_base(base_full, rgba, crop_rect, paste_canvas_size)
+                            rgba = composite_result_on_base(
+                                base_full, rgba, crop_rect, paste_canvas_size,
+                                paste_mask=mask_full, mask_blur=job.params.mask_blur,
+                            )
                         out_path = out_dir / f"result_{int(time.time())}_{i:03d}.png"
                         cv2_write_png_unicode(out_path, rgba)
                         latest_rel = str(out_path.relative_to(self.job_dir(job.job_id))).replace("\\", "/")
