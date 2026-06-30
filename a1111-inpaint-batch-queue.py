@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 APP_TITLE = "A1111 Inpaint Batch Queue"
-APP_REV = "v21"
+APP_REV = "v22"
 SETTINGS_NAME = "a1111-inpaint-batch-queue-settings.json"
 PROJECT_FILE_NAME = "project.json"
 PROJECT_SETTINGS_NAME = "settings.json"
@@ -1669,7 +1669,7 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         root = QVBoxLayout(tab)
         root.setContentsMargins(8, 8, 8, 8)
-        row = QHBoxLayout()
+
         self.api_btn = QPushButton("API設定")
         self.test_btn = QPushButton("Test API")
         self.dry_btn = QPushButton("DryRun request.json")
@@ -1677,6 +1677,7 @@ class MainWindow(QMainWindow):
         self.run_checked_btn = QPushButton("チェック済み一括実行")
         self.run_failed_btn = QPushButton("失敗だけ再実行")
         self.stop_btn = QPushButton("中断")
+
         self.api_btn.clicked.connect(self.show_api_settings)
         self.test_btn.clicked.connect(self.test_api)
         self.dry_btn.clicked.connect(self.dry_run_current)
@@ -1684,11 +1685,20 @@ class MainWindow(QMainWindow):
         self.run_checked_btn.clicked.connect(self.run_checked_jobs)
         self.run_failed_btn.clicked.connect(self.run_failed_jobs)
         self.stop_btn.clicked.connect(self.request_stop)
-        for b in [self.api_btn, self.test_btn, self.dry_btn, self.run_current_btn, self.run_checked_btn, self.run_failed_btn, self.stop_btn]:
-            set_widget_can_shrink(b)
-            row.addWidget(b)
-        row.addStretch(1)
-        root.addLayout(row)
+
+        row1 = QHBoxLayout()
+        row2 = QHBoxLayout()
+        for b in [self.api_btn, self.test_btn, self.dry_btn, self.run_current_btn]:
+            b.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+            row1.addWidget(b, 0)
+        row1.addStretch(1)
+        for b in [self.run_checked_btn, self.run_failed_btn, self.stop_btn]:
+            b.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+            row2.addWidget(b, 0)
+        row2.addStretch(1)
+        root.addLayout(row1)
+        root.addLayout(row2)
+
         self.progress_label = QLabel("待機中")
         root.addWidget(self.progress_label)
         self.log_edit = QTextEdit()
