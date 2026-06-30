@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 APP_TITLE = "A1111 Inpaint Batch Queue"
-APP_REV = "v29"
+APP_REV = "v30"
 SETTINGS_NAME = "a1111-inpaint-batch-queue-settings.json"
 PROJECT_FILE_NAME = "project.json"
 PROJECT_SETTINGS_NAME = "settings.json"
@@ -1697,6 +1697,8 @@ class MainWindow(QMainWindow):
         self._build_params_tab()
         self._build_run_tab()
         self._build_result_tab()
+        self.tabs.currentChanged.connect(self.on_tab_changed)
+        self.update_result_shortcuts_enabled()
 
     def _build_image_tab(self) -> None:
         tab = QWidget()
@@ -1951,8 +1953,9 @@ class MainWindow(QMainWindow):
         self.result_shortcuts = []
 
         def add_result_shortcut(seq: str, delta: int) -> None:
-            shortcut = QShortcut(QKeySequence(seq), tab)
-            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut = QShortcut(QKeySequence(seq), self)
+            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            shortcut.setEnabled(False)
             shortcut.activated.connect(lambda d=delta: self.navigate_result_selection(d))
             self.result_shortcuts.append(shortcut)
 
@@ -1963,6 +1966,22 @@ class MainWindow(QMainWindow):
 
         self.refresh_result_combo(None)
         self.tabs.addTab(tab, "出力結果")
+
+    def update_result_shortcuts_enabled(self) -> None:
+        enabled = getattr(self, "result_tab", None) is not None and self.tabs.currentWidget() is self.result_tab
+        for shortcut in getattr(self, "result_shortcuts", []):
+            try:
+                shortcut.setEnabled(enabled)
+            except Exception:
+                pass
+
+    def on_tab_changed(self, _index: int) -> None:
+        self.update_result_shortcuts_enabled()
+        if getattr(self, "result_tab", None) is not None and self.tabs.currentWidget() is self.result_tab:
+            try:
+                self.result_canvas.setFocus(Qt.FocusReason.TabFocusReason)
+            except Exception:
+                pass
 
     def _build_actions(self) -> None:
         file_menu = self.menuBar().addMenu("ファイル")
