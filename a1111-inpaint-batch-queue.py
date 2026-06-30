@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 APP_TITLE = "A1111 Inpaint Batch Queue"
-APP_REV = "v34"
+APP_REV = "v35"
 SETTINGS_NAME = "a1111-inpaint-batch-queue-settings.json"
 PROJECT_FILE_NAME = "project.json"
 PROJECT_SETTINGS_NAME = "settings.json"
@@ -642,7 +642,7 @@ class ApiSettings:
     username: str = ""
     password: str = ""
     save_password: bool = False
-    timeout: int = 600
+    timeout: int = 1800
     verify_ssl: bool = True
 
     @classmethod
@@ -655,7 +655,7 @@ class ApiSettings:
         base.save_password = bool(data.get("save_password", False))
         base.password = str(data.get("password", "")) if base.save_password else ""
         try:
-            base.timeout = clamp_int(int(data.get("timeout", base.timeout)), 5, 3600)
+            base.timeout = clamp_int(int(data.get("timeout", base.timeout)), 5, 86400)
         except Exception:
             pass
         base.verify_ssl = bool(data.get("verify_ssl", True))
@@ -1386,7 +1386,7 @@ class ApiSettingsDialog(QDialog):
         self.save_password_check = QCheckBox("パスワードを保存")
         self.save_password_check.setChecked(self.settings.save_password)
         self.timeout_spin = QSpinBox()
-        self.timeout_spin.setRange(5, 3600)
+        self.timeout_spin.setRange(5, 86400)
         self.timeout_spin.setValue(self.settings.timeout)
         self.verify_ssl_check = QCheckBox("SSL証明書を検証")
         self.verify_ssl_check.setChecked(self.settings.verify_ssl)
@@ -1394,10 +1394,10 @@ class ApiSettingsDialog(QDialog):
         form.addRow("User", self.user_edit)
         form.addRow("Password", self.password_edit)
         form.addRow("", self.save_password_check)
-        form.addRow("Timeout 秒", self.timeout_spin)
+        form.addRow("Client Timeout 秒", self.timeout_spin)
         form.addRow("", self.verify_ssl_check)
         layout.addLayout(form)
-        hint = QLabel("例: http://localhost:7860 / https://xxxx.container.sakurausercontent.com")
+        hint = QLabel("例: http://localhost:7860 / https://xxxx.container.sakurausercontent.com\nHTTP 504 はサーバー/プロキシ側の upstream timeout です。実行は1枚ずつ分割して長時間リクエストを避けます。")
         hint.setStyleSheet("color: #666;")
         layout.addWidget(hint)
         buttons = QHBoxLayout()
@@ -1464,6 +1464,11 @@ def api_request(settings: ApiSettings, method: str, path: str, payload: Optional
             return json.loads(raw.decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
+        if exc.code == 504:
+            raise RuntimeError(
+                f"HTTP 504: upstream request timeout / サーバーまたはプロキシ側のタイムアウトです。"
+                f" Client Timeoutを伸ばしても、サーバー側の上限が短いと回避できません。detail={detail[:800]}"
+            )
         raise RuntimeError(f"HTTP {exc.code}: {detail[:800]}")
 
 
@@ -2969,6 +2974,10 @@ class MainWindow(QMainWindow):
             'paste_canvas_size': {'w': int(prep.paste_canvas_size[0]), 'h': int(prep.paste_canvas_size[1])} if prep.paste_canvas_size else None,
             'request_width': int(req.get('width', 0)),
             'request_height': int(req.get('height', 0)),
+            'request_batch_size': int(req.get('batch_size', 1)),
+            'request_n_iter': int(req.get('n_iter', 1)),
+            'split_execution': self.request_output_count(req) > 1,
+            'split_total_outputs': self.request_output_count(req),
             'resize_mode': req.get('resize_mode'),
             'inpaint_full_res': req.get('inpaint_full_res'),
             'inpaint_full_res_padding': req.get('inpaint_full_res_padding'),
@@ -2977,6 +2986,26 @@ class MainWindow(QMainWindow):
         }
         write_json_utf8(debug_dir / 'debug_request_meta.json', meta)
         return debug_dir
+
+    def split_request_for_single_image(self, req: dict, output_index: int) -> dict:
+        single = dict(req)
+        single['batch_size'] = 1
+        single['n_iter'] = 1
+        try:
+            seed = int(req.get('seed', -1))
+        except Exception:
+            seed = -1
+        if seed >= 0:
+            single['seed'] = seed + max(0, int(output_index))
+        return single
+
+    def request_output_count(self, req: dict) -> int:
+        try:
+            batch_size = max(1, int(req.get('batch_size', 1)))
+            n_iter = max(1, int(req.get('n_iter', 1)))
+            return max(1, batch_size * n_iter)
+        except Exception:
+            return 1
 
     def dry_run_current(self) -> None:
         if not self.confirm_unsaved_current_job():
@@ -3052,27 +3081,44 @@ class MainWindow(QMainWindow):
                     self.ui_log(f"API debug保存: {debug_dir}")
                     crop_rect = prep.paste_rect
                     paste_canvas_size = prep.paste_canvas_size
-                    res = api_post(self.api_settings, "/sdapi/v1/img2img", req)
-                    images = res.get("images", []) if isinstance(res, dict) else []
-                    if not images:
-                        raise RuntimeError("APIレスポンスにimagesがありません。")
+                    total_outputs = self.request_output_count(req)
                     out_dir = self.job_dir(job.job_id) / RESULT_DIR_NAME
                     out_dir.mkdir(parents=True, exist_ok=True)
                     latest_rel = ""
-                    for i, img_b64 in enumerate(images, 1):
-                        rgba = decode_api_image_to_rgba(img_b64)
-                        if crop_rect is not None:
-                            rgba = composite_result_on_base(
-                                base_full, rgba, crop_rect, paste_canvas_size,
-                                paste_mask=mask_full, mask_blur=job.params.mask_blur,
-                            )
-                        out_path = out_dir / f"result_{int(time.time())}_{i:03d}.png"
-                        cv2_write_png_unicode(out_path, rgba)
-                        latest_rel = str(out_path.relative_to(self.job_dir(job.job_id))).replace("\\", "/")
+                    saved_count = 0
+                    if total_outputs > 1:
+                        self.ui_log(f"分割実行: {total_outputs}枚を1枚ずつAPI送信")
+                    for request_index in range(total_outputs):
+                        if self._cancel_requested:
+                            self.ui_log("中断しました")
+                            break
+                        single_req = self.split_request_for_single_image(req, request_index)
+                        write_json_utf8(debug_dir / f"debug_actual_request_{request_index + 1:03d}.json", single_req)
+                        if total_outputs > 1:
+                            self.ui_progress(f"実行中 {index}/{len(jobs)}: {job.name} / {request_index + 1}/{total_outputs}")
+                        res = api_post(self.api_settings, "/sdapi/v1/img2img", single_req)
+                        images = res.get("images", []) if isinstance(res, dict) else []
+                        if not images:
+                            raise RuntimeError("APIレスポンスにimagesがありません。")
+                        for img_b64 in images:
+                            saved_count += 1
+                            rgba_raw = decode_api_image_to_rgba(img_b64)
+                            cv2_write_png_unicode(debug_dir / f"debug_raw_result_{saved_count:03d}.png", rgba_raw)
+                            rgba = rgba_raw
+                            if crop_rect is not None:
+                                rgba = composite_result_on_base(
+                                    base_full, rgba, crop_rect, paste_canvas_size,
+                                    paste_mask=mask_full, mask_blur=job.params.mask_blur,
+                                )
+                            out_path = out_dir / f"result_{int(time.time())}_{saved_count:03d}.png"
+                            cv2_write_png_unicode(out_path, rgba)
+                            latest_rel = str(out_path.relative_to(self.job_dir(job.job_id))).replace("\\", "/")
+                    if saved_count <= 0:
+                        raise RuntimeError("出力画像が保存されませんでした。")
                     job.latest_result = latest_rel
                     job.status = "完了"
                     self.save_job(job)
-                    self.ui_log(f"完了: {job.name} / {len(images)}枚")
+                    self.ui_log(f"完了: {job.name} / {saved_count}枚")
                     self.ui_refresh_jobs()
                     if self.current_job() is not None and self.current_job().job_id == job.job_id:
                         self.ui_reload_current_result(job.job_id)
