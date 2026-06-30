@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 APP_TITLE = "A1111 Inpaint Batch Queue"
-APP_REV = "v16"
+APP_REV = "v17"
 SETTINGS_NAME = "a1111-inpaint-batch-queue-settings.json"
 PROJECT_FILE_NAME = "project.json"
 PROJECT_SETTINGS_NAME = "settings.json"
@@ -277,6 +277,45 @@ def resized_for_api(rgba: np.ndarray, mask: np.ndarray, max_size_key: str) -> Tu
     return np.ascontiguousarray(rgba_out), np.ascontiguousarray(mask_out), True
 
 
+def prompt_text_for_api(text: str) -> str:
+    """Remove prompt comment lines before sending to the API.
+
+    Lines whose first character is '#' are user comments and are kept in the
+    job file/UI, but are not sent to AUTOMATIC1111.
+    """
+    lines = []
+    for line in str(text or "").splitlines():
+        if line.startswith("#"):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def unique_name(base: str, existing: Iterable[str]) -> str:
+    base = str(base or "").strip() or "新規プリセット"
+    existing_set = set(str(x) for x in existing)
+    if base not in existing_set:
+        return base
+    index = 2
+    while f"{base} {index}" in existing_set:
+        index += 1
+    return f"{base} {index}"
+
+
+def sanitize_param_presets(data: object) -> Dict[str, Dict[str, object]]:
+    cleaned: Dict[str, Dict[str, object]] = {}
+    if isinstance(data, dict):
+        for raw_name, raw_values in data.items():
+            name = str(raw_name).strip()
+            if not name or not isinstance(raw_values, dict):
+                continue
+            params = InpaintParams.from_dict(raw_values)
+            cleaned[name] = asdict(params)
+    if not cleaned:
+        cleaned["標準"] = asdict(InpaintParams())
+    return cleaned
+
+
 def open_path_in_explorer(path: Path, select_file: bool = False) -> None:
     path = Path(path)
     if sys.platform.startswith("win"):
@@ -470,7 +509,6 @@ class MaskCanvas(QWidget):
     toolChanged = Signal(str)
     zoomChanged = Signal(float)
     fileDropped = Signal(list)
-    resultNavigate = Signal(int)
 
     MIN_ZOOM_SCALE = 0.05
     MAX_ZOOM_SCALE = 40.0
@@ -978,14 +1016,6 @@ class MaskCanvas(QWidget):
             self.set_tool("eraser")
             event.accept()
             return
-        if key in (Qt.Key.Key_Left, Qt.Key.Key_Up):
-            self.resultNavigate.emit(-1)
-            event.accept()
-            return
-        if key in (Qt.Key.Key_Right, Qt.Key.Key_Down):
-            self.resultNavigate.emit(1)
-            event.accept()
-            return
         if key == Qt.Key.Key_Space:
             self.space_down = True
             self.setCursor(Qt.CursorShape.OpenHandCursor)
@@ -1129,6 +1159,7 @@ class MainWindow(QMainWindow):
         self.current_job_index: Optional[int] = None
         self.api_settings = ApiSettings()
         self.api_max_size = "unlimited"
+        self.param_presets: Dict[str, Dict[str, object]] = sanitize_param_presets(None)
         self.loading_ui = True
         self._refreshing_job_list = False
         self._selecting_job = False
@@ -1211,7 +1242,6 @@ class MainWindow(QMainWindow):
         self.canvas.maskChanged.connect(self.on_mask_changed)
         self.canvas.toolChanged.connect(self.on_canvas_tool_changed)
         self.canvas.fileDropped.connect(self.add_image_paths)
-        self.canvas.resultNavigate.connect(self.navigate_result_selection)
         layout.addWidget(self.canvas, 1)
 
         row1 = QHBoxLayout()
@@ -1273,6 +1303,24 @@ class MainWindow(QMainWindow):
         name_row.addWidget(self.checked_box)
         root.addLayout(name_row)
 
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("プリセット"))
+        self.preset_combo = QComboBox()
+        self.preset_combo.setEditable(True)
+        no_insert = getattr(getattr(QComboBox, "InsertPolicy", QComboBox), "NoInsert")
+        self.preset_combo.setInsertPolicy(no_insert)
+        self.preset_combo.setMinimumWidth(260)
+        self.preset_combo.activated.connect(self.on_preset_activated)
+        self.preset_new_btn = QPushButton("New")
+        self.preset_del_btn = QPushButton("Del")
+        self.preset_new_btn.clicked.connect(self.new_param_preset_from_current)
+        self.preset_del_btn.clicked.connect(self.delete_current_param_preset)
+        preset_row.addWidget(self.preset_combo, 1)
+        preset_row.addWidget(self.preset_new_btn)
+        preset_row.addWidget(self.preset_del_btn)
+        root.addLayout(preset_row)
+        self.refresh_preset_combo()
+
         self.prompt_edit = QTextEdit()
         self.prompt_edit.setPlaceholderText("Prompt")
         self.prompt_edit.setMinimumHeight(110)
@@ -1308,9 +1356,10 @@ class MainWindow(QMainWindow):
                 grid.addWidget(QLabel(label), r, c)
             grid.addWidget(widget, r, c + 1)
         root.addLayout(grid)
-        save_btn = QPushButton("現在のジョブに反映")
-        save_btn.clicked.connect(self.save_current_job_from_ui)
-        root.addWidget(save_btn, 0, Qt.AlignmentFlag.AlignRight)
+        self.save_job_btn = QPushButton("現在のジョブを保存")
+        self.save_job_btn.setToolTip("ジョブ名、プロンプト、パラメータ、現在のマスクを job.json / mask.png に保存します。")
+        self.save_job_btn.clicked.connect(self.save_current_job_from_ui)
+        root.addWidget(self.save_job_btn, 0, Qt.AlignmentFlag.AlignRight)
         root.addStretch(1)
         self.tabs.addTab(tab, "パラメータ")
 
@@ -1401,12 +1450,100 @@ class MainWindow(QMainWindow):
             action.setChecked(action_key == key)
             action.blockSignals(False)
 
+    # ---------- parameter presets ----------
+    def refresh_preset_combo(self, select_name: Optional[str] = None) -> None:
+        combo = getattr(self, "preset_combo", None)
+        if combo is None:
+            return
+        if not self.param_presets:
+            self.param_presets = sanitize_param_presets(None)
+        current_text = str(select_name or combo.currentText() or "").strip()
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            for name in self.param_presets.keys():
+                combo.addItem(name)
+            target = select_name or (current_text if current_text in self.param_presets else "")
+            if target:
+                idx = combo.findText(target)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+                elif combo.lineEdit() is not None:
+                    combo.lineEdit().setText(target)
+            elif combo.count() > 0:
+                combo.setCurrentIndex(0)
+        finally:
+            combo.blockSignals(False)
+        if hasattr(self, "preset_del_btn"):
+            self.preset_del_btn.setEnabled(bool(self.param_presets))
+
+    def set_params_to_ui(self, params: InpaintParams) -> None:
+        prev_loading = self.loading_ui
+        self.loading_ui = True
+        try:
+            self.prompt_edit.setPlainText(params.prompt)
+            self.negative_edit.setPlainText(params.negative_prompt)
+            self.sampler_edit.setText(params.sampler_name)
+            self.steps_spin.setValue(params.steps)
+            self.cfg_spin.setValue(params.cfg_scale)
+            self.denoise_spin.setValue(params.denoising_strength)
+            self.mask_blur_spin.setValue(params.mask_blur)
+            self.padding_spin.setValue(params.inpaint_full_res_padding)
+            idx = self.fill_combo.findData(params.inpainting_fill)
+            self.fill_combo.setCurrentIndex(max(0, idx))
+            self.full_res_check.setChecked(params.inpaint_full_res)
+            self.batch_spin.setValue(params.batch_size)
+            self.niter_spin.setValue(params.n_iter)
+            self.seed_spin.setValue(params.seed)
+        finally:
+            self.loading_ui = prev_loading
+
+    def on_preset_activated(self, index: int) -> None:
+        if getattr(self, "loading_ui", False):
+            return
+        name = self.preset_combo.itemText(index).strip() if index >= 0 else self.preset_combo.currentText().strip()
+        self.apply_param_preset(name)
+
+    def apply_param_preset(self, name: str) -> None:
+        name = str(name or "").strip()
+        values = self.param_presets.get(name)
+        if not values:
+            return
+        params = InpaintParams.from_dict(values)
+        self.set_params_to_ui(params)
+        self.save_current_job_from_ui(refresh_list=False)
+        self.log(f"プリセット適用: {name}")
+
+    def new_param_preset_from_current(self) -> None:
+        base = self.preset_combo.currentText().strip() if hasattr(self, "preset_combo") else ""
+        name = unique_name(base or "新規プリセット", self.param_presets.keys())
+        self.param_presets[name] = asdict(self.params_from_ui())
+        self.refresh_preset_combo(name)
+        self._save_app_settings()
+        self.log(f"プリセット保存: {name}")
+
+    def delete_current_param_preset(self) -> None:
+        if not hasattr(self, "preset_combo"):
+            return
+        name = self.preset_combo.currentText().strip()
+        if not name or name not in self.param_presets:
+            return
+        del self.param_presets[name]
+        if not self.param_presets:
+            self.param_presets = sanitize_param_presets(None)
+        next_name = next(iter(self.param_presets.keys()))
+        self.refresh_preset_combo(next_name)
+        self._save_app_settings()
+        self.log(f"プリセット削除: {name}")
+
     # ---------- settings ----------
     def _load_app_settings(self) -> None:
         data = read_json_utf8(settings_path(), {})
         if not isinstance(data, dict):
             data = {}
         self.api_settings = ApiSettings.from_dict(data.get("api", {}))
+        self.param_presets = sanitize_param_presets(data.get("param_presets"))
+        self.refresh_preset_combo()
         max_size = str(data.get("max_api_size", "unlimited"))
         self.api_max_size = max_size if max_size in MAX_API_SIZE_OPTIONS else "unlimited"
         self.sync_max_size_actions()
@@ -1449,6 +1586,7 @@ class MainWindow(QMainWindow):
                 "last_project": str(self.project_dir),
                 "api": self.api_settings.to_dict(),
                 "max_api_size": self.api_max_size,
+                "param_presets": self.param_presets,
                 "window": {
                     "normal_geometry": {"x": geom.x(), "y": geom.y(), "width": geom.width(), "height": geom.height()},
                     "maximized": bool(self.isMaximized()),
@@ -1707,21 +1845,7 @@ class MainWindow(QMainWindow):
                 return
             self.job_name_edit.setText(job.name)
             self.checked_box.setChecked(job.checked)
-            p = job.params
-            self.prompt_edit.setPlainText(p.prompt)
-            self.negative_edit.setPlainText(p.negative_prompt)
-            self.sampler_edit.setText(p.sampler_name)
-            self.steps_spin.setValue(p.steps)
-            self.cfg_spin.setValue(p.cfg_scale)
-            self.denoise_spin.setValue(p.denoising_strength)
-            self.mask_blur_spin.setValue(p.mask_blur)
-            self.padding_spin.setValue(p.inpaint_full_res_padding)
-            idx = self.fill_combo.findData(p.inpainting_fill)
-            self.fill_combo.setCurrentIndex(max(0, idx))
-            self.full_res_check.setChecked(p.inpaint_full_res)
-            self.batch_spin.setValue(p.batch_size)
-            self.niter_spin.setValue(p.n_iter)
-            self.seed_spin.setValue(p.seed)
+            self.set_params_to_ui(job.params)
             base = cv2_read_rgba_unicode(self.job_input_abs(job))
             mask_path = self.job_mask_abs(job)
             mask = cv2_read_mask_unicode(mask_path, (base.shape[1], base.shape[0])) if mask_path.exists() else np.zeros(base.shape[:2], dtype=np.uint8)
@@ -1851,8 +1975,8 @@ class MainWindow(QMainWindow):
         req = {
             "init_images": [numpy_rgba_to_png_base64(base_api)],
             "mask": numpy_mask_to_png_base64(mask_api),
-            "prompt": p.prompt,
-            "negative_prompt": p.negative_prompt,
+            "prompt": prompt_text_for_api(p.prompt),
+            "negative_prompt": prompt_text_for_api(p.negative_prompt),
             "sampler_name": p.sampler_name,
             "steps": p.steps,
             "cfg_scale": p.cfg_scale,
