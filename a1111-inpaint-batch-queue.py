@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 APP_TITLE = "A1111 Inpaint Batch Queue"
-APP_REV = "v18"
+APP_REV = "v19"
 SETTINGS_NAME = "a1111-inpaint-batch-queue-settings.json"
 PROJECT_FILE_NAME = "project.json"
 PROJECT_SETTINGS_NAME = "settings.json"
@@ -1504,16 +1504,18 @@ class MainWindow(QMainWindow):
 
         self.prompt_edit = QTextEdit()
         self.prompt_edit.setPlaceholderText("Prompt")
-        self.prompt_edit.setMinimumHeight(110)
+        self.prompt_edit.setMinimumHeight(78)
+        self.prompt_edit.setMaximumHeight(96)
         self.negative_edit = QTextEdit()
         self.negative_edit.setPlaceholderText("Negative Prompt")
-        self.negative_edit.setMinimumHeight(90)
+        neg_h = self.negative_edit.fontMetrics().lineSpacing() * 2 + 18
+        self.negative_edit.setMinimumHeight(neg_h)
+        self.negative_edit.setMaximumHeight(neg_h + 8)
         root.addWidget(QLabel("Prompt"))
         root.addWidget(self.prompt_edit)
         root.addWidget(QLabel("Negative Prompt"))
         root.addWidget(self.negative_edit)
 
-        grid = QGridLayout()
         self.sampler_edit = QLineEdit("Euler a")
         self.steps_spin = QSpinBox(); self.steps_spin.setRange(1, 150); self.steps_spin.setValue(28)
         self.cfg_spin = QDoubleSpinBox(); self.cfg_spin.setRange(0.0, 30.0); self.cfg_spin.setSingleStep(0.5); self.cfg_spin.setValue(5.0)
@@ -1525,18 +1527,34 @@ class MainWindow(QMainWindow):
         self.batch_spin = QSpinBox(); self.batch_spin.setRange(1, 16); self.batch_spin.setValue(1)
         self.niter_spin = QSpinBox(); self.niter_spin.setRange(1, 100); self.niter_spin.setValue(4)
         self.seed_spin = QSpinBox(); self.seed_spin.setRange(-1, 2147483647); self.seed_spin.setValue(-1)
-        widgets = [
-            ("Sampler", self.sampler_edit), ("Steps", self.steps_spin), ("CFG", self.cfg_spin), ("Denoise", self.denoise_spin),
-            ("Mask blur", self.mask_blur_spin), ("Padding", self.padding_spin), ("Fill", self.fill_combo), ("", self.full_res_check),
-            ("Batch size", self.batch_spin), ("n_iter", self.niter_spin), ("Seed", self.seed_spin),
+
+        param_column = QVBoxLayout()
+        param_column.setSpacing(6)
+        param_descriptions = [
+            ("Sampler", self.sampler_edit, "画像生成の計算方式。Euler a は速くて変化が出やすい。"),
+            ("Steps", self.steps_spin, "生成の反復回数。多いほど丁寧だが遅い。28なら普通〜やや多め。"),
+            ("CFG", self.cfg_spin, "プロンプトへの従わせ具合。高いほど指示に強く寄るが破綻もしやすい。5.0は控えめ。"),
+            ("Denoise", self.denoise_spin, "元画像をどれだけ作り変えるか。0.55 はそこそこ変える。低いほど元画像維持。"),
+            ("Mask blur", self.mask_blur_spin, "マスク境界のぼかし量。大きいほど修正部分の境目がなじむが、広がりやすい。"),
+            ("Padding", self.padding_spin, "マスク周辺をどれだけ含めて再生成するか。大きいほど周囲との整合性を見やすい。"),
+            ("Fill", self.fill_combo, "マスク部分の初期内容。original は元画像をベースに修正する。"),
+            ("inpaint_full_res", self.full_res_check, "マスク部分を高解像度で切り抜いて処理する。細部修正向き。"),
+            ("Batch size", self.batch_spin, "同時に生成する枚数。VRAM使用量に直結。"),
+            ("n_iter", self.niter_spin, "生成を何回繰り返すか。最終的な出力枚数は Batch size × n_iter。"),
+            ("Seed", self.seed_spin, "乱数の固定値。-1 は毎回ランダム。"),
         ]
-        for idx, (label, widget) in enumerate(widgets):
-            r = idx // 2
-            c = (idx % 2) * 2
-            if label:
-                grid.addWidget(QLabel(label), r, c)
-            grid.addWidget(widget, r, c + 1)
-        root.addLayout(grid)
+        for label_text, widget, description in param_descriptions:
+            field_row = QHBoxLayout()
+            label = QLabel(label_text)
+            label.setMinimumWidth(120)
+            field_row.addWidget(label)
+            field_row.addWidget(widget, 1)
+            desc_label = QLabel(description)
+            desc_label.setWordWrap(True)
+            desc_label.setStyleSheet("color: #666;")
+            param_column.addLayout(field_row)
+            param_column.addWidget(desc_label)
+        root.addLayout(param_column)
         self.save_job_btn = QPushButton("現在のジョブを保存")
         self.save_job_btn.setToolTip("ジョブ名、プロンプト、パラメータ、現在のマスクを job.json / mask.png に保存します。")
         self.save_job_btn.clicked.connect(self.save_current_job_from_ui)
