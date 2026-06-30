@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 APP_TITLE = "A1111 Inpaint Batch Queue"
-APP_REV = "v20"
+APP_REV = "v21"
 SETTINGS_NAME = "a1111-inpaint-batch-queue-settings.json"
 PROJECT_FILE_NAME = "project.json"
 PROJECT_SETTINGS_NAME = "settings.json"
@@ -1490,14 +1490,14 @@ class MainWindow(QMainWindow):
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("表示"))
         self.mode_combo = QComboBox()
-        self.mode_combo.setMinimumWidth(90)
-        set_widget_can_shrink(self.mode_combo)
+        self.mode_combo.setMinimumWidth(110)
+        self.mode_combo.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.mode_combo.currentIndexChanged.connect(self.on_display_combo_changed)
         self.open_result_btn = QPushButton("開く")
-        set_widget_can_shrink(self.open_result_btn)
+        self.open_result_btn.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         self.open_result_btn.clicked.connect(self.open_selected_result_path)
-        row1.addWidget(self.mode_combo)
-        row1.addWidget(self.open_result_btn)
+        row1.addWidget(self.mode_combo, 0)
+        row1.addWidget(self.open_result_btn, 0)
         self.refresh_display_combo(None, preferred_mode="overlay")
         row1.addSpacing(10)
         self.brush_btn = QPushButton("ブラシ [1]")
@@ -1510,18 +1510,22 @@ class MainWindow(QMainWindow):
         self.eraser_btn.clicked.connect(lambda: self.canvas.set_tool("eraser"))
         self.crop_btn.clicked.connect(lambda: self.canvas.set_tool("crop"))
         for b in [self.brush_btn, self.eraser_btn, self.crop_btn]:
-            set_widget_can_shrink(b)
-        row1.addWidget(self.brush_btn)
-        row1.addWidget(self.eraser_btn)
-        row1.addWidget(self.crop_btn)
+            b.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        row1.addWidget(self.brush_btn, 0)
+        row1.addWidget(self.eraser_btn, 0)
+        row1.addWidget(self.crop_btn, 0)
         self.brush_size_spin = QSpinBox()
         self.brush_size_spin.setRange(1, 500)
         self.brush_size_spin.setValue(48)
         self.brush_size_spin.setMinimumWidth(60)
+        self.brush_size_spin.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         self.brush_size_spin.valueChanged.connect(self.canvas.set_brush_size)
         row1.addWidget(QLabel("サイズ"))
-        row1.addWidget(self.brush_size_spin)
+        row1.addWidget(self.brush_size_spin, 0)
         row1.addStretch(1)
+        layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
         self.fit_btn = QPushButton("表示合わせ")
         self.actual_btn = QPushButton("100%")
         self.clear_mask_btn = QPushButton("マスク全消去")
@@ -1535,9 +1539,10 @@ class MainWindow(QMainWindow):
         self.load_mask_btn.clicked.connect(self.load_mask_dialog)
         self.clear_crop_btn.clicked.connect(lambda: self.canvas.clear_crop_rect())
         for b in [self.fit_btn, self.actual_btn, self.clear_mask_btn, self.invert_mask_btn, self.load_mask_btn, self.clear_crop_btn]:
-            set_widget_can_shrink(b)
-            row1.addWidget(b)
-        layout.addLayout(row1)
+            b.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+            row2.addWidget(b, 0)
+        row2.addStretch(1)
+        layout.addLayout(row2)
         hint = QLabel("左ドラッグ: ブラシ/消しゴム/クロップ / 右ドラッグ: 表示移動 / ホイール: 拡大縮小 / Space+左ドラッグ: 表示移動 / Delete: クロップ解除")
         hint.setStyleSheet("color: #666;")
         layout.addWidget(hint)
