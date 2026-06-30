@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 APP_TITLE = "A1111 Inpaint Batch Queue"
-APP_REV = "v28"
+APP_REV = "v29"
 SETTINGS_NAME = "a1111-inpaint-batch-queue-settings.json"
 PROJECT_FILE_NAME = "project.json"
 PROJECT_SETTINGS_NAME = "settings.json"
@@ -65,7 +65,7 @@ except Exception as exc:  # pragma: no cover
 
 try:
     from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
-    from PySide6.QtGui import QAction, QActionGroup, QColor, QDragEnterEvent, QDropEvent, QImage, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QWheelEvent, QTextCursor
+    from PySide6.QtGui import QAction, QActionGroup, QColor, QDragEnterEvent, QDropEvent, QImage, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QShortcut, QWheelEvent, QTextCursor
     from PySide6.QtWidgets import (
         QApplication,
         QAbstractItemView,
@@ -1460,6 +1460,97 @@ def make_bold_label(text: str) -> QLabel:
     return label
 
 
+
+
+class ResultCanvas(MaskCanvas):
+    """出力結果専用ビュー。MaskCanvasの高速描画・ズーム・パンだけを使い、編集操作は持たせない。"""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setAcceptDrops(False)
+        self.tool = "view"
+        self.mode = "image"
+
+    def set_result_image(self, rgba: Optional[np.ndarray], fit: bool = True) -> None:
+        if rgba is None:
+            self.set_images(None, None, None, fit=fit)
+            return
+        h, w = rgba.shape[:2]
+        mask = np.zeros((h, w), dtype=np.uint8)
+        self.crop_enabled = False
+        self.crop_rect = None
+        self.crop_drawing = False
+        self.set_images(rgba, mask, None, fit=fit)
+        self.mode = "image"
+        self.tool = "view"
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        if self.base_rgba is None:
+            painter = QPainter(self)
+            painter.fillRect(self.rect(), QColor(32, 32, 34))
+            painter.setPen(QColor(220, 220, 220))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "出力結果なし")
+            return
+        super().paintEvent(event)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # type: ignore[override]
+        event.ignore()
+
+    def dropEvent(self, event: QDropEvent) -> None:  # type: ignore[override]
+        event.ignore()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        pos = QPointF(event.position())
+        if event.button() in (Qt.MouseButton.RightButton, Qt.MouseButton.MiddleButton) or (event.button() == Qt.MouseButton.LeftButton and self.space_down):
+            self.panning = True
+            self.pan_last_pos = pos
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        event.ignore()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        pos = QPointF(event.position())
+        if self.panning and self.pan_last_pos is not None and self.view_center is not None:
+            scale = self.get_current_scale()
+            delta = pos - self.pan_last_pos
+            self.view_center = QPointF(self.view_center.x() - delta.x() / max(scale, 1e-6), self.view_center.y() - delta.y() / max(scale, 1e-6))
+            self.pan_last_pos = pos
+            self.clamp_view_center()
+            self.invalidate_cache()
+            self.update()
+            event.accept()
+            return
+        event.ignore()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if self.panning and event.button() in (Qt.MouseButton.RightButton, Qt.MouseButton.MiddleButton, Qt.MouseButton.LeftButton):
+            self.panning = False
+            self.pan_last_pos = None
+            self.unsetCursor()
+            event.accept()
+            return
+        event.ignore()
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if event.key() == Qt.Key.Key_Space:
+            self.space_down = True
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            event.accept()
+            return
+        event.ignore()
+
+    def keyReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if event.key() == Qt.Key.Key_Space:
+            self.space_down = False
+            if not self.panning:
+                self.unsetCursor()
+            event.accept()
+            return
+        event.ignore()
+
+
 class MainWindow(QMainWindow):
     logSignal = Signal(str)
     progressSignal = Signal(str)
@@ -1605,6 +1696,7 @@ class MainWindow(QMainWindow):
         self._build_image_tab()
         self._build_params_tab()
         self._build_run_tab()
+        self._build_result_tab()
 
     def _build_image_tab(self) -> None:
         tab = QWidget()
@@ -1618,16 +1710,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.canvas, 1)
 
         row1 = QHBoxLayout()
-        row1.addWidget(QLabel("表示"))
         self.mode_combo = QComboBox()
         self.mode_combo.setMinimumWidth(110)
         self.mode_combo.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.mode_combo.currentIndexChanged.connect(self.on_display_combo_changed)
-        self.open_result_btn = QPushButton("開く")
-        self.open_result_btn.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
-        self.open_result_btn.clicked.connect(self.open_selected_result_path)
         row1.addWidget(self.mode_combo, 0)
-        row1.addWidget(self.open_result_btn, 0)
         self.refresh_display_combo(None, preferred_mode="overlay")
         row1.addSpacing(10)
         self.brush_btn = QPushButton("ブラシ [1]")
@@ -1679,7 +1766,7 @@ class MainWindow(QMainWindow):
         self.crop_info_label = QLabel("クロップ: 未設定")
         self.crop_info_label.setStyleSheet("color: #666;")
         layout.addWidget(self.crop_info_label)
-        self.tabs.addTab(tab, "画像")
+        self.tabs.addTab(tab, "画像編集")
         self.on_canvas_tool_changed("brush")
         self.update_crop_info_label()
 
@@ -1835,6 +1922,47 @@ class MainWindow(QMainWindow):
         self.log_edit.setReadOnly(True)
         root.addWidget(self.log_edit, 1)
         self.tabs.addTab(tab, "実行")
+
+    def _build_result_tab(self) -> None:
+        tab = QWidget()
+        self.result_tab = tab
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(6, 6, 6, 6)
+        self.result_canvas = ResultCanvas()
+        layout.addWidget(self.result_canvas, 1)
+
+        row = QHBoxLayout()
+        self.result_combo = QComboBox()
+        self.result_combo.setMinimumWidth(150)
+        self.result_combo.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.result_combo.currentIndexChanged.connect(self.on_result_combo_changed)
+        self.result_open_btn = QPushButton("開く")
+        self.result_open_btn.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        self.result_open_btn.clicked.connect(self.open_selected_result_path)
+        row.addWidget(self.result_combo, 0)
+        row.addWidget(self.result_open_btn, 0)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        hint = QLabel("ホイール: 拡大縮小 / 右ドラッグ: 表示移動 / Space+左ドラッグ: 表示移動 / 次: Alt+Right, Right, Down / 前: Alt+Left, Left, Up")
+        hint.setStyleSheet("color: #666;")
+        layout.addWidget(hint)
+
+        self.result_shortcuts = []
+
+        def add_result_shortcut(seq: str, delta: int) -> None:
+            shortcut = QShortcut(QKeySequence(seq), tab)
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(lambda d=delta: self.navigate_result_selection(d))
+            self.result_shortcuts.append(shortcut)
+
+        for seq in ["Right", "Down", "Alt+Right"]:
+            add_result_shortcut(seq, 1)
+        for seq in ["Left", "Up", "Alt+Left"]:
+            add_result_shortcut(seq, -1)
+
+        self.refresh_result_combo(None)
+        self.tabs.addTab(tab, "出力結果")
 
     def _build_actions(self) -> None:
         file_menu = self.menuBar().addMenu("ファイル")
@@ -2313,8 +2441,10 @@ class MainWindow(QMainWindow):
                 self.negative_edit.setPlainText("")
                 self.canvas.set_images(None, None, None)
                 self.canvas.clear_crop_rect(emit_signal=False)
+                self.result_canvas.set_result_image(None)
                 self.update_crop_info_label()
                 self.refresh_display_combo(None, preferred_mode="overlay")
+                self.refresh_result_combo(None)
                 return
             self.job_name_edit.setText(job.name)
             self.checked_box.setChecked(job.checked)
@@ -2322,19 +2452,13 @@ class MainWindow(QMainWindow):
             base = cv2_read_rgba_unicode(self.job_input_abs(job))
             mask_path = self.job_mask_abs(job)
             mask = cv2_read_mask_unicode(mask_path, (base.shape[1], base.shape[0])) if mask_path.exists() else np.zeros(base.shape[:2], dtype=np.uint8)
-            result = None
-            result_path = self.job_latest_result_abs(job)
-            if result_path is not None:
-                try:
-                    result = cv2_read_rgba_unicode(result_path)
-                except Exception:
-                    result = None
             preferred_mode = self.current_display_mode()
-            self.refresh_display_combo(job, preferred_mode=preferred_mode, select_rel=job.latest_result if preferred_mode == "result" else "")
-            self.canvas.set_images(base, mask, result, fit=True)
+            self.refresh_display_combo(job, preferred_mode=preferred_mode)
+            self.canvas.set_images(base, mask, None, fit=True)
             self.canvas.set_crop_rect(job.crop_rect if job.crop_enabled else None, emit_signal=False)
             self.update_crop_info_label()
             self.canvas.set_mode(self.current_display_mode())
+            self.refresh_result_combo(job, select_rel=job.latest_result)
         except Exception as exc:
             self.log(f"ジョブ読込失敗: {safe_exception_text(exc)}")
             print(f"Job load error: {safe_exception_text(exc)}", file=sys.stderr)
@@ -2614,29 +2738,21 @@ class MainWindow(QMainWindow):
         job = self.current_job()
         if job is None or job.job_id != job_id:
             return
-        self.refresh_display_combo(job, preferred_mode=self.current_display_mode(), select_rel=job.latest_result)
-        p = self.result_abs(job, job.latest_result) if job.latest_result else self.job_latest_result_abs(job)
-        if p is not None and p.exists():
-            try:
-                self.canvas.set_result(cv2_read_rgba_unicode(p))
-                if self.current_display_mode() == "result":
-                    self.canvas.set_mode("result")
-            except Exception:
-                pass
+        self.refresh_result_combo(job, select_rel=job.latest_result)
 
-    # ---------- result display ----------
+    # ---------- image/result display ----------
     def display_item_data(self, index: Optional[int] = None) -> Dict[str, str]:
         combo_index = self.mode_combo.currentIndex() if index is None else int(index)
         data = self.mode_combo.itemData(combo_index) if combo_index >= 0 else None
         if isinstance(data, dict):
-            return {"mode": str(data.get("mode", "overlay")), "rel": str(data.get("rel", ""))}
+            return {"mode": str(data.get("mode", "overlay")), "rel": ""}
         if isinstance(data, str):
             return {"mode": data, "rel": ""}
         return {"mode": "overlay", "rel": ""}
 
     def current_display_mode(self) -> str:
         mode = self.display_item_data().get("mode", "overlay")
-        return mode if mode in {"image", "mask", "overlay", "result"} else "overlay"
+        return mode if mode in {"image", "mask", "overlay"} else "overlay"
 
     def result_dir(self, job: JobData) -> Path:
         return self.job_dir(job.job_id) / RESULT_DIR_NAME
@@ -2659,54 +2775,70 @@ class MainWindow(QMainWindow):
         return entries
 
     def refresh_display_combo(self, job: Optional[JobData], preferred_mode: str = "overlay", select_rel: str = "") -> None:
-        preferred_mode = preferred_mode if preferred_mode in {"image", "mask", "overlay", "result"} else "overlay"
-        entries = self.result_entries(job)
+        del job, select_rel
+        preferred_mode = preferred_mode if preferred_mode in {"image", "mask", "overlay"} else "overlay"
         self.mode_combo.blockSignals(True)
         try:
             self.mode_combo.clear()
             static_items = [("画像", "image"), ("マスク", "mask"), ("合成", "overlay")]
             for label, mode in static_items:
                 self.mode_combo.addItem(label, {"mode": mode, "rel": ""})
-            selected_index = 2
-            if preferred_mode in {"image", "mask", "overlay"}:
-                selected_index = {"image": 0, "mask": 1, "overlay": 2}.get(preferred_mode, 2)
-            result_start = self.mode_combo.count()
-            for i, (rel, _path) in enumerate(entries, 1):
-                self.mode_combo.addItem(f"出力結果({i:03d})", {"mode": "result", "rel": rel})
-                if preferred_mode == "result" and select_rel and rel == select_rel:
-                    selected_index = result_start + i - 1
-            if preferred_mode == "result" and entries and (selected_index < result_start):
-                # 指定結果がない場合は最新相当の最後の出力を選ぶ。
-                selected_index = self.mode_combo.count() - 1
+            selected_index = {"image": 0, "mask": 1, "overlay": 2}.get(preferred_mode, 2)
             self.mode_combo.setCurrentIndex(selected_index)
         finally:
             self.mode_combo.blockSignals(False)
         self.on_display_combo_changed(self.mode_combo.currentIndex())
 
     def on_display_combo_changed(self, _index: int) -> None:
-        data = self.display_item_data()
-        mode = data.get("mode", "overlay")
-        if mode == "result":
-            job = self.current_job()
-            rel = data.get("rel", "")
-            result_path = self.result_abs(job, rel) if job is not None and rel else None
-            if result_path is not None and result_path.exists():
-                try:
-                    self.canvas.set_result(cv2_read_rgba_unicode(result_path))
-                except Exception as exc:
-                    self.log(f"出力結果読込失敗: {safe_exception_text(exc)}")
-            self.canvas.set_mode("result")
+        self.canvas.set_mode(self.current_display_mode())
+
+    def result_item_data(self, index: Optional[int] = None) -> Dict[str, str]:
+        combo_index = self.result_combo.currentIndex() if index is None else int(index)
+        data = self.result_combo.itemData(combo_index) if combo_index >= 0 else None
+        if isinstance(data, dict):
+            return {"rel": str(data.get("rel", ""))}
+        if isinstance(data, str):
+            return {"rel": data}
+        return {"rel": ""}
+
+    def refresh_result_combo(self, job: Optional[JobData], select_rel: str = "") -> None:
+        entries = self.result_entries(job)
+        self.result_combo.blockSignals(True)
+        try:
+            self.result_combo.clear()
+            if not entries:
+                self.result_combo.addItem("出力結果なし", {"rel": ""})
+                self.result_combo.setCurrentIndex(0)
+            else:
+                selected_index = len(entries) - 1
+                for i, (rel, _path) in enumerate(entries, 1):
+                    self.result_combo.addItem(f"出力結果{i:03d}", {"rel": rel})
+                    if select_rel and rel == select_rel:
+                        selected_index = i - 1
+                self.result_combo.setCurrentIndex(selected_index)
+        finally:
+            self.result_combo.blockSignals(False)
+        self.on_result_combo_changed(self.result_combo.currentIndex())
+
+    def on_result_combo_changed(self, _index: int) -> None:
+        path = self.selected_result_path()
+        if path is None:
+            self.result_canvas.set_result_image(None)
             return
-        self.canvas.set_mode(mode)
+        try:
+            self.result_canvas.set_result_image(cv2_read_rgba_unicode(path), fit=True)
+        except Exception as exc:
+            self.result_canvas.set_result_image(None)
+            self.log(f"出力結果読込失敗: {safe_exception_text(exc)}")
 
     def selected_result_path(self) -> Optional[Path]:
         job = self.current_job()
         if job is None:
             return None
-        data = self.display_item_data()
-        if data.get("mode") != "result" or not data.get("rel"):
+        rel = self.result_item_data().get("rel", "")
+        if not rel:
             return None
-        path = self.result_abs(job, data["rel"])
+        path = self.result_abs(job, rel)
         return path if path.exists() else None
 
     def open_selected_result_path(self) -> None:
@@ -2722,23 +2854,25 @@ class MainWindow(QMainWindow):
         open_path_in_explorer(folder, select_file=False)
 
     def result_combo_indexes(self) -> List[int]:
-        indexes = []
-        for i in range(self.mode_combo.count()):
-            if self.display_item_data(i).get("mode") == "result":
+        indexes: List[int] = []
+        for i in range(self.result_combo.count()):
+            if self.result_item_data(i).get("rel"):
                 indexes.append(i)
         return indexes
 
     def navigate_result_selection(self, delta: int) -> None:
+        if getattr(self, "result_tab", None) is not None and self.tabs.currentWidget() is not self.result_tab:
+            return
         indexes = self.result_combo_indexes()
         if not indexes:
             return
-        current = self.mode_combo.currentIndex()
+        current = self.result_combo.currentIndex()
         if current in indexes:
             pos = indexes.index(current)
             next_pos = clamp_int(pos + int(delta), 0, len(indexes) - 1)
         else:
             next_pos = 0 if delta > 0 else len(indexes) - 1
-        self.mode_combo.setCurrentIndex(indexes[next_pos])
+        self.result_combo.setCurrentIndex(indexes[next_pos])
 
     # ---------- window/system events ----------
     def log(self, text: str) -> None:
