@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 APP_TITLE = "A1111 Inpaint Batch Queue"
-APP_REV = "v32"
+APP_REV = "v33"
 SETTINGS_NAME = "a1111-inpaint-batch-queue-settings.json"
 PROJECT_FILE_NAME = "project.json"
 PROJECT_SETTINGS_NAME = "settings.json"
@@ -257,6 +257,35 @@ def numpy_rgba_to_png_base64(rgba: np.ndarray) -> str:
     ok, buf = cv2.imencode(".png", bgra)
     if not ok:
         raise ValueError("画像PNGエンコードに失敗しました。")
+    return base64.b64encode(buf.tobytes()).decode("ascii")
+
+
+def rgba_to_opaque_rgb(rgba: np.ndarray, background: Tuple[int, int, int] = (255, 255, 255)) -> np.ndarray:
+    """Flatten RGBA onto a solid background for Stable Diffusion API input.
+
+    AUTOMATIC1111 accepts PNG input, but alpha-bearing PNGs can be interpreted
+    inconsistently by model/preprocess paths.  The inpaint mask is sent
+    separately, so the init image should be an ordinary opaque RGB image.
+    """
+    if rgba.ndim != 3:
+        raise ValueError("画像配列ではありません。")
+    arr = rgba.astype(np.uint8)
+    if arr.shape[2] == 3:
+        return np.ascontiguousarray(arr[:, :, :3])
+    if arr.shape[2] != 4:
+        raise ValueError("RGB/RGBA画像ではありません。")
+    alpha = arr[:, :, 3:4].astype(np.float32) / 255.0
+    bg = np.array(background, dtype=np.float32).reshape(1, 1, 3)
+    rgb = arr[:, :, :3].astype(np.float32) * alpha + bg * (1.0 - alpha)
+    return np.ascontiguousarray(np.clip(rgb, 0, 255).astype(np.uint8))
+
+
+def numpy_rgba_to_api_png_base64(rgba: np.ndarray) -> str:
+    rgb = rgba_to_opaque_rgb(rgba)
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    ok, buf = cv2.imencode(".png", bgr)
+    if not ok:
+        raise ValueError("API送信画像PNGエンコードに失敗しました。")
     return base64.b64encode(buf.tobytes()).decode("ascii")
 
 
@@ -2882,12 +2911,12 @@ class MainWindow(QMainWindow):
         p = job.params
         crop_active = prep.paste_rect is not None
         # Manual crop sends an already-cropped image. Force request dimensions to the
-        # actual API image size and disable A1111's additional full-res crop to avoid
-        # width/height mismatches and double-crop corruption.
+        # actual API image size.  Do not override inpaint_full_res here; A1111's
+        # full-res inpaint is still useful for tiny masked areas inside the crop.
         w = int(base_api.shape[1]) if crop_active else (p.width or int(base_api.shape[1]))
         h = int(base_api.shape[0]) if crop_active else (p.height or int(base_api.shape[0]))
         req = {
-            "init_images": [numpy_rgba_to_png_base64(base_api)],
+            "init_images": [numpy_rgba_to_api_png_base64(base_api)],
             "mask": numpy_mask_to_png_base64(mask_api),
             "prompt": prompt_text_for_api(p.prompt),
             "negative_prompt": prompt_text_for_api(p.negative_prompt),
@@ -2895,8 +2924,9 @@ class MainWindow(QMainWindow):
             "steps": p.steps,
             "cfg_scale": p.cfg_scale,
             "denoising_strength": p.denoising_strength,
+            "resize_mode": 0,
             "mask_blur": p.mask_blur,
-            "inpaint_full_res": False if crop_active else p.inpaint_full_res,
+            "inpaint_full_res": p.inpaint_full_res,
             "inpaint_full_res_padding": p.inpaint_full_res_padding,
             "inpainting_fill": p.inpainting_fill,
             "inpainting_mask_invert": p.inpainting_mask_invert,
