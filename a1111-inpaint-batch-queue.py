@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 APP_TITLE = "A1111 Inpaint Batch Queue"
-APP_REV = "v30"
+APP_REV = "v31"
 SETTINGS_NAME = "a1111-inpaint-batch-queue-settings.json"
 PROJECT_FILE_NAME = "project.json"
 PROJECT_SETTINGS_NAME = "settings.json"
@@ -497,8 +497,6 @@ def sanitize_param_presets(data: object) -> Dict[str, Dict[str, object]]:
                 continue
             params = InpaintParams.from_dict(raw_values)
             cleaned[name] = asdict(params)
-    if not cleaned:
-        cleaned["標準"] = asdict(InpaintParams())
     return cleaned
 
 
@@ -654,6 +652,7 @@ class JobData:
     checked: bool = True
     params: InpaintParams = field(default_factory=InpaintParams)
     latest_result: str = ""
+    preset_name: str = ""
     crop_enabled: bool = False
     crop_rect: Optional[Tuple[int, int, int, int]] = None
     created_at: float = field(default_factory=time.time)
@@ -676,6 +675,7 @@ class JobData:
             checked=bool(data.get("checked", True)),
             params=InpaintParams.from_dict(data.get("params")),
             latest_result=str(data.get("latest_result", "")),
+            preset_name=str(data.get("preset_name", "")),
             crop_enabled=crop_enabled,
             crop_rect=crop_rect,
             created_at=float(data.get("created_at", time.time())),
@@ -695,6 +695,7 @@ class JobData:
             "checked": self.checked,
             "params": asdict(self.params),
             "latest_result": self.latest_result,
+            "preset_name": str(self.preset_name or ""),
             "crop_enabled": bool(self.crop_enabled and rect_dict is not None),
             "crop_rect": rect_dict,
             "created_at": self.created_at,
@@ -1462,6 +1463,14 @@ def make_bold_label(text: str) -> QLabel:
 
 
 
+def set_button_keep_visible(button: QPushButton) -> None:
+    try:
+        button.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        button.setMinimumWidth(max(24, button.minimumSizeHint().width()))
+    except Exception:
+        pass
+
+
 class ResultCanvas(MaskCanvas):
     """出力結果専用ビュー。MaskCanvasの高速描画・ズーム・パンだけを使い、編集操作は持たせない。"""
 
@@ -1628,11 +1637,19 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._sync_text_area_heights()
+        self.update_button_minimum_widths()
         self.sync_font_size_actions()
         if save:
             self._save_app_settings()
         if log_change:
             self.log(f"文字サイズ: {point_size}pt")
+
+    def update_button_minimum_widths(self) -> None:
+        try:
+            for button in self.findChildren(QPushButton):
+                set_button_keep_visible(button)
+        except Exception:
+            pass
 
     # ---------- UI ----------
     def _build_ui(self) -> None:
@@ -1673,8 +1690,8 @@ class MainWindow(QMainWindow):
         self.down_btn.clicked.connect(lambda: self.move_job(1))
         self.check_btn.clicked.connect(self.toggle_current_checked)
         for b in [self.add_btn, self.remove_btn, self.up_btn, self.down_btn, self.check_btn]:
-            set_widget_can_shrink(b)
-            job_btns1.addWidget(b)
+            set_button_keep_visible(b)
+            job_btns1.addWidget(b, 0)
         left_layout.addLayout(job_btns1)
         self.splitter.addWidget(left)
 
@@ -1697,6 +1714,7 @@ class MainWindow(QMainWindow):
         self._build_params_tab()
         self._build_run_tab()
         self._build_result_tab()
+        self.update_button_minimum_widths()
         self.tabs.currentChanged.connect(self.on_tab_changed)
         self.update_result_shortcuts_enabled()
 
@@ -1805,10 +1823,11 @@ class MainWindow(QMainWindow):
         self.preset_combo.setMinimumWidth(120)
         set_widget_can_shrink(self.preset_combo)
         self.preset_combo.activated.connect(self.on_preset_activated)
-        self.preset_new_btn = QPushButton("New")
-        self.preset_del_btn = QPushButton("Del")
-        set_widget_can_shrink(self.preset_new_btn)
-        set_widget_can_shrink(self.preset_del_btn)
+        self.preset_combo.editTextChanged.connect(lambda _text: self.update_preset_buttons_state())
+        self.preset_new_btn = QPushButton("新規")
+        self.preset_del_btn = QPushButton("削除")
+        set_button_keep_visible(self.preset_new_btn)
+        set_button_keep_visible(self.preset_del_btn)
         self.preset_new_btn.clicked.connect(self.new_param_preset_from_current)
         self.preset_del_btn.clicked.connect(self.delete_current_param_preset)
         preset_row.addWidget(self.preset_combo, 1)
@@ -1846,6 +1865,7 @@ class MainWindow(QMainWindow):
             self.batch_spin, self.niter_spin, self.seed_spin, self.checked_box,
         ]:
             set_widget_can_shrink(widget)
+        self._connect_preset_dirty_signals()
 
         param_column = QVBoxLayout()
         param_column.setSpacing(6)
@@ -1876,7 +1896,7 @@ class MainWindow(QMainWindow):
         root.addLayout(param_column)
         self.save_job_btn = QPushButton("現在のジョブを保存")
         self.save_job_btn.setToolTip("ジョブ名、プロンプト、パラメータ、現在のマスクを job.json / mask.png に保存します。")
-        set_widget_can_shrink(self.save_job_btn)
+        set_button_keep_visible(self.save_job_btn)
         self.save_job_btn.clicked.connect(self.save_current_job_from_ui)
         root.addWidget(self.save_job_btn, 0, Qt.AlignmentFlag.AlignRight)
         root.addStretch(1)
@@ -2068,27 +2088,81 @@ class MainWindow(QMainWindow):
         combo = getattr(self, "preset_combo", None)
         if combo is None:
             return
-        if not self.param_presets:
-            self.param_presets = sanitize_param_presets(None)
-        current_text = str(select_name or combo.currentText() or "").strip()
+        target = str(select_name or "").strip()
+        if target and target not in self.param_presets:
+            target = ""
         combo.blockSignals(True)
         try:
             combo.clear()
+            combo.addItem("")
             for name in self.param_presets.keys():
                 combo.addItem(name)
-            target = select_name or (current_text if current_text in self.param_presets else "")
             if target:
                 idx = combo.findText(target)
-                if idx >= 0:
-                    combo.setCurrentIndex(idx)
-                elif combo.lineEdit() is not None:
-                    combo.lineEdit().setText(target)
-            elif combo.count() > 0:
+                combo.setCurrentIndex(idx if idx >= 0 else 0)
+            else:
                 combo.setCurrentIndex(0)
+                if combo.lineEdit() is not None:
+                    combo.lineEdit().setText("")
         finally:
             combo.blockSignals(False)
+        self.update_preset_buttons_state()
+
+    def set_preset_combo_text(self, name: str) -> None:
+        combo = getattr(self, "preset_combo", None)
+        if combo is None:
+            return
+        name = str(name or "").strip()
+        if name and name not in self.param_presets:
+            name = ""
+        combo.blockSignals(True)
+        try:
+            idx = combo.findText(name) if name else 0
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            if combo.lineEdit() is not None:
+                combo.lineEdit().setText(name)
+        finally:
+            combo.blockSignals(False)
+        self.update_preset_buttons_state()
+
+    def update_preset_buttons_state(self) -> None:
+        combo = getattr(self, "preset_combo", None)
+        text = combo.currentText().strip() if combo is not None else ""
         if hasattr(self, "preset_del_btn"):
-            self.preset_del_btn.setEnabled(bool(self.param_presets))
+            self.preset_del_btn.setEnabled(bool(text and text in self.param_presets))
+
+    def _connect_preset_dirty_signals(self) -> None:
+        dirty = self.clear_current_job_preset_due_to_param_change
+        self.prompt_edit.textChanged.connect(dirty)
+        self.negative_edit.textChanged.connect(dirty)
+        self.sampler_edit.textChanged.connect(dirty)
+        self.steps_spin.valueChanged.connect(lambda _v: dirty())
+        self.cfg_spin.valueChanged.connect(lambda _v: dirty())
+        self.denoise_spin.valueChanged.connect(lambda _v: dirty())
+        self.mask_blur_spin.valueChanged.connect(lambda _v: dirty())
+        self.padding_spin.valueChanged.connect(lambda _v: dirty())
+        self.fill_combo.currentIndexChanged.connect(lambda _v: dirty())
+        self.full_res_check.toggled.connect(lambda _v: dirty())
+        self.batch_spin.valueChanged.connect(lambda _v: dirty())
+        self.niter_spin.valueChanged.connect(lambda _v: dirty())
+        self.seed_spin.valueChanged.connect(lambda _v: dirty())
+
+    def clear_current_job_preset_due_to_param_change(self) -> None:
+        if getattr(self, "loading_ui", False) or getattr(self, "_applying_preset", False):
+            return
+        job = self.current_job()
+        combo_text = self.preset_combo.currentText().strip() if hasattr(self, "preset_combo") else ""
+        if job is None and not combo_text:
+            return
+        if job is not None and not getattr(job, "preset_name", "") and not combo_text:
+            return
+        if job is not None:
+            job.preset_name = ""
+            try:
+                self.save_job(job)
+            except Exception:
+                pass
+        self.set_preset_combo_text("")
 
     def set_params_to_ui(self, params: InpaintParams) -> None:
         prev_loading = self.loading_ui
@@ -2122,9 +2196,18 @@ class MainWindow(QMainWindow):
         values = self.param_presets.get(name)
         if not values:
             return
-        params = InpaintParams.from_dict(values)
-        self.set_params_to_ui(params)
-        self.save_current_job_from_ui(refresh_list=False)
+        prev_applying = getattr(self, "_applying_preset", False)
+        self._applying_preset = True
+        try:
+            params = InpaintParams.from_dict(values)
+            self.set_params_to_ui(params)
+            job = self.current_job()
+            if job is not None:
+                job.preset_name = name
+            self.set_preset_combo_text(name)
+            self.save_current_job_from_ui(refresh_list=False)
+        finally:
+            self._applying_preset = prev_applying
         self.log(f"プリセット適用: {name}")
 
     def new_param_preset_from_current(self) -> None:
@@ -2132,6 +2215,10 @@ class MainWindow(QMainWindow):
         name = unique_name(base or "新規プリセット", self.param_presets.keys())
         self.param_presets[name] = asdict(self.params_from_ui())
         self.refresh_preset_combo(name)
+        job = self.current_job()
+        if job is not None:
+            job.preset_name = name
+            self.save_current_job_from_ui(refresh_list=False)
         self._save_app_settings()
         self.log(f"プリセット保存: {name}")
 
@@ -2142,10 +2229,11 @@ class MainWindow(QMainWindow):
         if not name or name not in self.param_presets:
             return
         del self.param_presets[name]
-        if not self.param_presets:
-            self.param_presets = sanitize_param_presets(None)
-        next_name = next(iter(self.param_presets.keys()))
-        self.refresh_preset_combo(next_name)
+        job = self.current_job()
+        if job is not None and getattr(job, "preset_name", "") == name:
+            job.preset_name = ""
+            self.save_job(job)
+        self.refresh_preset_combo("")
         self._save_app_settings()
         self.log(f"プリセット削除: {name}")
 
@@ -2458,6 +2546,7 @@ class MainWindow(QMainWindow):
                 self.checked_box.setChecked(False)
                 self.prompt_edit.setPlainText("")
                 self.negative_edit.setPlainText("")
+                self.set_preset_combo_text("")
                 self.canvas.set_images(None, None, None)
                 self.canvas.clear_crop_rect(emit_signal=False)
                 self.result_canvas.set_result_image(None)
@@ -2468,6 +2557,7 @@ class MainWindow(QMainWindow):
             self.job_name_edit.setText(job.name)
             self.checked_box.setChecked(job.checked)
             self.set_params_to_ui(job.params)
+            self.set_preset_combo_text(job.preset_name if job.preset_name in self.param_presets else "")
             base = cv2_read_rgba_unicode(self.job_input_abs(job))
             mask_path = self.job_mask_abs(job)
             mask = cv2_read_mask_unicode(mask_path, (base.shape[1], base.shape[0])) if mask_path.exists() else np.zeros(base.shape[:2], dtype=np.uint8)
