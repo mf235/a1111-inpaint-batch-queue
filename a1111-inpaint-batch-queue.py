@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 APP_TITLE = "A1111 Inpaint Batch Queue"
-APP_REV = "v31"
+APP_REV = "v32"
 SETTINGS_NAME = "a1111-inpaint-batch-queue-settings.json"
 PROJECT_FILE_NAME = "project.json"
 PROJECT_SETTINGS_NAME = "settings.json"
@@ -1582,6 +1582,10 @@ class MainWindow(QMainWindow):
         self._refreshing_job_list = False
         self._selecting_job = False
         self._closing_app = False
+        self.param_dirty = False
+        self.image_dirty = False
+        self.job_meta_dirty = False
+        self.preset_mismatch = False
         self._mask_save_pending = False
         self._mask_save_timer = QTimer(self)
         self._mask_save_timer.setSingleShot(True)
@@ -1722,6 +1726,14 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(6, 6, 6, 6)
+        image_header = QHBoxLayout()
+        image_header.addStretch(1)
+        self.save_job_btn_image = QPushButton("現在のジョブを保存")
+        self.save_job_btn_image.setToolTip("マスク、クロップ、プロンプト、パラメータを含めて現在のジョブを保存します。")
+        set_button_keep_visible(self.save_job_btn_image)
+        self.save_job_btn_image.clicked.connect(self.save_current_job_from_ui)
+        image_header.addWidget(self.save_job_btn_image, 0)
+        layout.addLayout(image_header)
         self.canvas = MaskCanvas()
         self.canvas.maskChanged.connect(self.on_mask_changed)
         self.canvas.cropChanged.connect(self.on_crop_changed)
@@ -1803,14 +1815,23 @@ class MainWindow(QMainWindow):
         content.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         root = QVBoxLayout(content)
         root.setContentsMargins(8, 8, 8, 8)
+        param_header = QHBoxLayout()
+        param_header.addStretch(1)
+        self.save_job_btn_params = QPushButton("現在のジョブを保存")
+        self.save_job_btn_params.setToolTip("マスク、クロップ、プロンプト、パラメータを含めて現在のジョブを保存します。")
+        set_button_keep_visible(self.save_job_btn_params)
+        self.save_job_btn_params.clicked.connect(self.save_current_job_from_ui)
+        param_header.addWidget(self.save_job_btn_params, 0)
+        root.addLayout(param_header)
+
         name_row = QHBoxLayout()
         name_row.addWidget(make_bold_label("ジョブ名"))
         self.job_name_edit = QLineEdit()
         set_widget_can_shrink(self.job_name_edit)
-        self.job_name_edit.editingFinished.connect(self.save_current_job_from_ui)
+        self.job_name_edit.textEdited.connect(lambda _text: self.mark_current_job_dirty(meta=True))
         name_row.addWidget(self.job_name_edit, 1)
         self.checked_box = QCheckBox("一括実行対象")
-        self.checked_box.toggled.connect(lambda _c: self.save_current_job_from_ui())
+        self.checked_box.toggled.connect(lambda _c: self.mark_current_job_dirty(meta=True))
         name_row.addWidget(self.checked_box)
         root.addLayout(name_row)
 
@@ -1824,14 +1845,21 @@ class MainWindow(QMainWindow):
         set_widget_can_shrink(self.preset_combo)
         self.preset_combo.activated.connect(self.on_preset_activated)
         self.preset_combo.editTextChanged.connect(lambda _text: self.update_preset_buttons_state())
+        self.preset_status_label = QLabel("")
+        self.preset_status_label.setStyleSheet("color: #d08000;")
         self.preset_new_btn = QPushButton("新規")
+        self.preset_update_btn = QPushButton("変更")
         self.preset_del_btn = QPushButton("削除")
         set_button_keep_visible(self.preset_new_btn)
+        set_button_keep_visible(self.preset_update_btn)
         set_button_keep_visible(self.preset_del_btn)
         self.preset_new_btn.clicked.connect(self.new_param_preset_from_current)
+        self.preset_update_btn.clicked.connect(self.update_current_param_preset)
         self.preset_del_btn.clicked.connect(self.delete_current_param_preset)
         preset_row.addWidget(self.preset_combo, 1)
+        preset_row.addWidget(self.preset_status_label)
         preset_row.addWidget(self.preset_new_btn)
+        preset_row.addWidget(self.preset_update_btn)
         preset_row.addWidget(self.preset_del_btn)
         root.addLayout(preset_row)
         self.refresh_preset_combo()
@@ -1894,11 +1922,6 @@ class MainWindow(QMainWindow):
             param_column.addLayout(field_row)
             param_column.addWidget(desc_label)
         root.addLayout(param_column)
-        self.save_job_btn = QPushButton("現在のジョブを保存")
-        self.save_job_btn.setToolTip("ジョブ名、プロンプト、パラメータ、現在のマスクを job.json / mask.png に保存します。")
-        set_button_keep_visible(self.save_job_btn)
-        self.save_job_btn.clicked.connect(self.save_current_job_from_ui)
-        root.addWidget(self.save_job_btn, 0, Qt.AlignmentFlag.AlignRight)
         root.addStretch(1)
         scroll.setWidget(content)
         outer.addWidget(scroll, 1)
@@ -2083,7 +2106,72 @@ class MainWindow(QMainWindow):
             action.setChecked(point_size == size)
             action.blockSignals(False)
 
-    # ---------- parameter presets ----------
+    # ---------- dirty state / parameter presets ----------
+    def current_preset_text(self) -> str:
+        combo = getattr(self, "preset_combo", None)
+        return combo.currentText().strip() if combo is not None else ""
+
+    def current_valid_preset_name(self) -> str:
+        name = self.current_preset_text()
+        return name if name in self.param_presets else ""
+
+    def has_unsaved_current_job(self) -> bool:
+        return bool(self.param_dirty or self.image_dirty or self.job_meta_dirty or self.preset_mismatch)
+
+    def clear_dirty_flags(self) -> None:
+        self.param_dirty = False
+        self.image_dirty = False
+        self.job_meta_dirty = False
+        self.preset_mismatch = False
+        self.update_dirty_ui()
+
+    def mark_current_job_dirty(self, meta: bool = False, param: bool = False, image: bool = False, preset_mismatch: bool = False) -> None:
+        if getattr(self, "loading_ui", False):
+            return
+        if self.current_job() is None:
+            return
+        if meta:
+            self.job_meta_dirty = True
+        if param:
+            self.param_dirty = True
+        if image:
+            self.image_dirty = True
+        if preset_mismatch and self.current_valid_preset_name():
+            self.preset_mismatch = True
+        job = self.current_job()
+        if job is not None:
+            job.status = "編集中"
+            self.update_current_job_list_item()
+        self.update_dirty_ui()
+
+    def update_dirty_ui(self) -> None:
+        dirty = self.has_unsaved_current_job()
+        title = f"{APP_TITLE} {APP_REV}" + (" *" if dirty else "")
+        try:
+            self.setWindowTitle(title)
+        except Exception:
+            pass
+        if hasattr(self, "preset_status_label"):
+            self.preset_status_label.setText("*" if self.preset_mismatch and self.current_valid_preset_name() else "")
+        self.update_preset_buttons_state()
+
+    def update_current_job_list_item(self) -> None:
+        idx = self.current_job_index
+        if idx is None or not (0 <= idx < len(self.jobs)):
+            return
+        item = self.job_list.item(idx) if hasattr(self, "job_list") else None
+        if item is None:
+            return
+        job = self.jobs[idx]
+        if hasattr(self, "checked_box") and idx == self.current_job_index:
+            mark = "☑" if self.checked_box.isChecked() else "☐"
+        else:
+            mark = "☑" if job.checked else "☐"
+        display_name = self.job_name_edit.text().strip() if hasattr(self, "job_name_edit") and idx == self.current_job_index else job.name
+        display_name = display_name or job.name or job.job_id
+        item.setText(f"{mark} {job.job_id} / {job.status} / {display_name}")
+        item.setData(Qt.ItemDataRole.UserRole, job.job_id)
+
     def refresh_preset_combo(self, select_name: Optional[str] = None) -> None:
         combo = getattr(self, "preset_combo", None)
         if combo is None:
@@ -2106,7 +2194,7 @@ class MainWindow(QMainWindow):
                     combo.lineEdit().setText("")
         finally:
             combo.blockSignals(False)
-        self.update_preset_buttons_state()
+        self.update_dirty_ui()
 
     def set_preset_combo_text(self, name: str) -> None:
         combo = getattr(self, "preset_combo", None)
@@ -2123,46 +2211,32 @@ class MainWindow(QMainWindow):
                 combo.lineEdit().setText(name)
         finally:
             combo.blockSignals(False)
-        self.update_preset_buttons_state()
+        self.update_dirty_ui()
 
     def update_preset_buttons_state(self) -> None:
         combo = getattr(self, "preset_combo", None)
         text = combo.currentText().strip() if combo is not None else ""
+        exists = bool(text and text in self.param_presets)
+        if hasattr(self, "preset_update_btn"):
+            self.preset_update_btn.setEnabled(exists)
         if hasattr(self, "preset_del_btn"):
-            self.preset_del_btn.setEnabled(bool(text and text in self.param_presets))
+            self.preset_del_btn.setEnabled(exists)
 
     def _connect_preset_dirty_signals(self) -> None:
-        dirty = self.clear_current_job_preset_due_to_param_change
-        self.prompt_edit.textChanged.connect(dirty)
-        self.negative_edit.textChanged.connect(dirty)
-        self.sampler_edit.textChanged.connect(dirty)
-        self.steps_spin.valueChanged.connect(lambda _v: dirty())
-        self.cfg_spin.valueChanged.connect(lambda _v: dirty())
-        self.denoise_spin.valueChanged.connect(lambda _v: dirty())
-        self.mask_blur_spin.valueChanged.connect(lambda _v: dirty())
-        self.padding_spin.valueChanged.connect(lambda _v: dirty())
-        self.fill_combo.currentIndexChanged.connect(lambda _v: dirty())
-        self.full_res_check.toggled.connect(lambda _v: dirty())
-        self.batch_spin.valueChanged.connect(lambda _v: dirty())
-        self.niter_spin.valueChanged.connect(lambda _v: dirty())
-        self.seed_spin.valueChanged.connect(lambda _v: dirty())
-
-    def clear_current_job_preset_due_to_param_change(self) -> None:
-        if getattr(self, "loading_ui", False) or getattr(self, "_applying_preset", False):
-            return
-        job = self.current_job()
-        combo_text = self.preset_combo.currentText().strip() if hasattr(self, "preset_combo") else ""
-        if job is None and not combo_text:
-            return
-        if job is not None and not getattr(job, "preset_name", "") and not combo_text:
-            return
-        if job is not None:
-            job.preset_name = ""
-            try:
-                self.save_job(job)
-            except Exception:
-                pass
-        self.set_preset_combo_text("")
+        dirty_param = lambda: self.mark_current_job_dirty(param=True, preset_mismatch=True)
+        self.prompt_edit.textChanged.connect(dirty_param)
+        self.negative_edit.textChanged.connect(dirty_param)
+        self.sampler_edit.textChanged.connect(dirty_param)
+        self.steps_spin.valueChanged.connect(lambda _v: dirty_param())
+        self.cfg_spin.valueChanged.connect(lambda _v: dirty_param())
+        self.denoise_spin.valueChanged.connect(lambda _v: dirty_param())
+        self.mask_blur_spin.valueChanged.connect(lambda _v: dirty_param())
+        self.padding_spin.valueChanged.connect(lambda _v: dirty_param())
+        self.fill_combo.currentIndexChanged.connect(lambda _v: dirty_param())
+        self.full_res_check.toggled.connect(lambda _v: dirty_param())
+        self.batch_spin.valueChanged.connect(lambda _v: dirty_param())
+        self.niter_spin.valueChanged.connect(lambda _v: dirty_param())
+        self.seed_spin.valueChanged.connect(lambda _v: dirty_param())
 
     def set_params_to_ui(self, params: InpaintParams) -> None:
         prev_loading = self.loading_ui
@@ -2205,7 +2279,8 @@ class MainWindow(QMainWindow):
             if job is not None:
                 job.preset_name = name
             self.set_preset_combo_text(name)
-            self.save_current_job_from_ui(refresh_list=False)
+            self.preset_mismatch = False
+            self.mark_current_job_dirty(param=True)
         finally:
             self._applying_preset = prev_applying
         self.log(f"プリセット適用: {name}")
@@ -2218,9 +2293,45 @@ class MainWindow(QMainWindow):
         job = self.current_job()
         if job is not None:
             job.preset_name = name
-            self.save_current_job_from_ui(refresh_list=False)
+            self.preset_mismatch = False
+            self.mark_current_job_dirty(param=True)
         self._save_app_settings()
         self.log(f"プリセット保存: {name}")
+
+    def update_current_param_preset(self) -> None:
+        if not hasattr(self, "preset_combo"):
+            return
+        name = self.preset_combo.currentText().strip()
+        if not name or name not in self.param_presets:
+            return
+        affected = [j for j in self.jobs if getattr(j, "preset_name", "") == name]
+        current = self.current_job()
+        if current is not None and current not in affected and self.current_valid_preset_name() == name:
+            affected.append(current)
+        msg = QMessageBox(self)
+        msg.setWindowTitle("プリセット変更")
+        msg.setText(f"プリセット「{name}」を現在の設定で変更します。\n同じ名前のプリセットを使用している {len(affected)} 件のジョブにも反映します。")
+        ok_btn = msg.addButton("OK", QMessageBox.ButtonRole.AcceptRole)
+        cancel_btn = msg.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
+        msg.setDefaultButton(ok_btn)
+        msg.exec()
+        if msg.clickedButton() is not ok_btn:
+            return
+        values = asdict(self.params_from_ui())
+        params = InpaintParams.from_dict(values)
+        self.param_presets[name] = asdict(params)
+        for job in affected:
+            job.params = InpaintParams.from_dict(values)
+            job.preset_name = name
+            self.save_job(job)
+        if current is not None and current in affected:
+            self.param_dirty = False
+            self.preset_mismatch = False
+            self.update_dirty_ui()
+            self.refresh_job_list(select_row=self.current_job_index if self.current_job_index is not None else -1)
+            self.update_current_job_list_item()
+        self._save_app_settings()
+        self.log(f"プリセット変更: {name} / 反映 {len(affected)}件")
 
     def delete_current_param_preset(self) -> None:
         if not hasattr(self, "preset_combo"):
@@ -2228,14 +2339,69 @@ class MainWindow(QMainWindow):
         name = self.preset_combo.currentText().strip()
         if not name or name not in self.param_presets:
             return
+        msg = QMessageBox(self)
+        msg.setWindowTitle("プリセット削除")
+        msg.setText(f"プリセット「{name}」を削除します。\nこのプリセットを使用しているジョブのプリセット名は空欄になります。")
+        ok_btn = msg.addButton("OK", QMessageBox.ButtonRole.AcceptRole)
+        cancel_btn = msg.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
+        msg.setDefaultButton(cancel_btn)
+        msg.exec()
+        if msg.clickedButton() is not ok_btn:
+            return
         del self.param_presets[name]
-        job = self.current_job()
-        if job is not None and getattr(job, "preset_name", "") == name:
-            job.preset_name = ""
-            self.save_job(job)
+        changed = 0
+        for job in self.jobs:
+            if getattr(job, "preset_name", "") == name:
+                job.preset_name = ""
+                self.save_job(job)
+                changed += 1
+        current = self.current_job()
+        if current is not None and getattr(current, "preset_name", "") == name:
+            current.preset_name = ""
         self.refresh_preset_combo("")
+        self.preset_mismatch = False
+        self.update_dirty_ui()
         self._save_app_settings()
-        self.log(f"プリセット削除: {name}")
+        self.log(f"プリセット削除: {name} / 解除 {changed}件")
+
+    def confirm_unsaved_current_job(self) -> bool:
+        if not self.has_unsaved_current_job():
+            return True
+        msg = QMessageBox(self)
+        msg.setWindowTitle("未保存の変更")
+        msg.setText("現在のジョブに未保存の変更があります。保存しますか？")
+        save_btn = msg.addButton("Save", QMessageBox.ButtonRole.AcceptRole)
+        discard_btn = msg.addButton("Discard", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_btn = msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        msg.setDefaultButton(save_btn)
+        msg.exec()
+        clicked = msg.clickedButton()
+        if clicked is save_btn:
+            return bool(self.save_current_job_from_ui())
+        if clicked is discard_btn:
+            self.discard_current_job_changes()
+            return True
+        return False
+
+    def discard_current_job_changes(self) -> None:
+        idx = self.current_job_index
+        if idx is None or not (0 <= idx < len(self.jobs)):
+            self.clear_dirty_flags()
+            return
+        old_job = self.jobs[idx]
+        job_file = self.job_dir(old_job.job_id) / JOB_FILE_NAME
+        try:
+            if job_file.exists():
+                fresh = JobData.from_dict(read_json_utf8(job_file, {}))
+                self.jobs[idx] = fresh
+                self.load_job_to_ui(fresh)
+            else:
+                self.load_job_to_ui(old_job)
+            self.clear_dirty_flags()
+            self.refresh_job_list(select_row=idx)
+            self.log("未保存の変更を破棄")
+        except Exception as exc:
+            self.log(f"破棄失敗: {safe_exception_text(exc)}")
 
     # ---------- settings ----------
     def _load_app_settings(self) -> None:
@@ -2311,22 +2477,24 @@ class MainWindow(QMainWindow):
             write_json_utf8(self.project_dir / PROJECT_FILE_NAME, {"app": APP_TITLE, "app_rev": APP_REV, "jobs": []})
 
     def new_project_dialog(self) -> None:
+        if not self.confirm_unsaved_current_job():
+            return
         path = QFileDialog.getExistingDirectory(self, "新規/既存プロジェクトフォルダを選択", str(self.project_dir.parent))
         if not path:
             return
-        self.save_current_job_from_ui()
         self.project_dir = Path(path)
         self._ensure_project()
         self.jobs = []
         self.current_job_index = None
-        self.save_project_all()
+        self.write_project_index()
         self.load_project(self.project_dir)
         self._save_app_settings()
 
     def open_project_dialog(self) -> None:
+        if not self.confirm_unsaved_current_job():
+            return
         path = QFileDialog.getExistingDirectory(self, "プロジェクトフォルダを開く", str(self.project_dir))
         if path:
-            self.save_current_job_from_ui()
             self.load_project(Path(path))
             self._save_app_settings()
 
@@ -2373,13 +2541,18 @@ class MainWindow(QMainWindow):
         finally:
             self.loading_ui = prev_loading
 
+    def write_project_index(self) -> None:
+        self.project_dir.mkdir(parents=True, exist_ok=True)
+        write_json_utf8(self.project_dir / PROJECT_FILE_NAME, {"app": APP_TITLE, "app_rev": APP_REV, "jobs": [{"job_id": j.job_id} for j in self.jobs]})
+        self._save_app_settings()
+
     def save_project_all(self) -> None:
-        self.save_current_job_from_ui()
+        if not self.save_current_job_from_ui():
+            return
         self.project_dir.mkdir(parents=True, exist_ok=True)
         for job in self.jobs:
             self.save_job(job)
-        write_json_utf8(self.project_dir / PROJECT_FILE_NAME, {"app": APP_TITLE, "app_rev": APP_REV, "jobs": [{"job_id": j.job_id} for j in self.jobs]})
-        self._save_app_settings()
+        self.write_project_index()
         self.log("保存完了")
 
     def next_job_id(self) -> str:
@@ -2439,7 +2612,8 @@ class MainWindow(QMainWindow):
             self.add_image_paths([Path(p) for p in paths])
 
     def add_image_paths(self, paths: Iterable[Path]) -> None:
-        self.save_current_job_from_ui()
+        if not self.confirm_unsaved_current_job():
+            return
         added = 0
         for src in paths:
             if not src.exists() or src.suffix.lower() not in SUPPORTED_IMAGE_EXTS:
@@ -2463,7 +2637,7 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.log(f"画像追加失敗: {src} / {exc}")
         if added:
-            self.save_project_all()
+            self.write_project_index()
             select_row = max(0, len(self.jobs) - added)
             self.current_job_index = select_row
             self.refresh_job_list(select_row=select_row)
@@ -2483,7 +2657,8 @@ class MainWindow(QMainWindow):
             self.log(f"ジョブ削除中のファイル削除失敗: {safe_exception_text(exc)}")
         del self.jobs[idx]
         self.current_job_index = None
-        self.save_project_all()
+        self.clear_dirty_flags()
+        self.write_project_index()
         if self.jobs:
             select_row = min(idx, len(self.jobs) - 1)
             self.current_job_index = select_row
@@ -2503,7 +2678,7 @@ class MainWindow(QMainWindow):
             return
         self.jobs[idx], self.jobs[ni] = self.jobs[ni], self.jobs[idx]
         self.current_job_index = ni
-        self.save_project_all()
+        self.write_project_index()
         self.refresh_job_list(select_row=ni)
 
     def toggle_current_checked(self) -> None:
@@ -2514,8 +2689,8 @@ class MainWindow(QMainWindow):
         self.checked_box.blockSignals(True)
         self.checked_box.setChecked(job.checked)
         self.checked_box.blockSignals(False)
-        self.save_job(job)
-        self.refresh_job_list(select_row=self.current_job_index if self.current_job_index is not None else -1)
+        self.mark_current_job_dirty(meta=True)
+        self.update_current_job_list_item()
 
     def current_job(self) -> Optional[JobData]:
         if self.current_job_index is None or not (0 <= self.current_job_index < len(self.jobs)):
@@ -2525,9 +2700,16 @@ class MainWindow(QMainWindow):
     def on_job_selected(self, row: int) -> None:
         if self.loading_ui or self._refreshing_job_list or self._selecting_job:
             return
+        old_idx = self.current_job_index
+        if old_idx is not None and row != old_idx and not self.confirm_unsaved_current_job():
+            self.job_list.blockSignals(True)
+            try:
+                self.job_list.setCurrentRow(old_idx)
+            finally:
+                self.job_list.blockSignals(False)
+            return
         self._selecting_job = True
         try:
-            self.save_current_job_from_ui(refresh_list=False)
             if row < 0 or row >= len(self.jobs):
                 self.current_job_index = None
                 self.load_job_to_ui(None)
@@ -2573,6 +2755,7 @@ class MainWindow(QMainWindow):
             print(f"Job load error: {safe_exception_text(exc)}", file=sys.stderr)
         finally:
             self.loading_ui = prev_loading
+            self.clear_dirty_flags()
 
     def params_from_ui(self) -> InpaintParams:
         p = InpaintParams()
@@ -2592,48 +2775,46 @@ class MainWindow(QMainWindow):
         p.clamp()
         return p
 
-    def save_current_job_from_ui(self, refresh_list: bool = True) -> None:
+    def save_current_job_from_ui(self, refresh_list: bool = True) -> bool:
         if getattr(self, "loading_ui", False):
-            return
+            return True
         job = self.current_job()
         if job is None:
-            return
+            self.clear_dirty_flags()
+            return True
         try:
             job.name = self.job_name_edit.text().strip() or job.job_id
             job.checked = bool(self.checked_box.isChecked())
             job.params = self.params_from_ui()
+            if self.preset_mismatch:
+                job.preset_name = ""
+                self.set_preset_combo_text("")
+            else:
+                job.preset_name = self.current_valid_preset_name()
             crop_rect = self.canvas.get_crop_rect()
             job.crop_enabled = crop_rect is not None
             job.crop_rect = crop_rect
             if self.canvas.mask is not None:
                 cv2_write_png_unicode(self.job_mask_abs(job), self.canvas.mask)
             self.save_job(job)
+            self.clear_dirty_flags()
             if refresh_list:
                 self.refresh_job_list(select_row=self.current_job_index if self.current_job_index is not None else -1)
+            self.log("現在のジョブを保存")
+            return True
         except Exception as exc:
             self.log(f"保存失敗: {safe_exception_text(exc)}")
+            return False
 
     def on_mask_changed(self) -> None:
-        job = self.current_job()
-        if job is None or self.canvas.mask is None:
+        if self.current_job() is None or self.canvas.mask is None:
             return
-        job.status = "編集中"
-        self._mask_save_pending = True
-        self._mask_save_timer.start(500)
+        self._mask_save_pending = False
+        self._mask_save_timer.stop()
+        self.mark_current_job_dirty(image=True)
 
     def flush_mask_save(self) -> None:
-        if not getattr(self, "_mask_save_pending", False):
-            return
-        job = self.current_job()
-        if job is None or self.canvas.mask is None:
-            self._mask_save_pending = False
-            return
-        try:
-            cv2_write_png_unicode(self.job_mask_abs(job), self.canvas.mask)
-            self.save_job(job)
-            self._mask_save_pending = False
-        except Exception as exc:
-            self.log(f"マスク保存失敗: {safe_exception_text(exc)}")
+        self._mask_save_pending = False
 
     def on_canvas_tool_changed(self, tool: str) -> None:
         self.brush_btn.blockSignals(True); self.eraser_btn.blockSignals(True); self.crop_btn.blockSignals(True)
@@ -2654,9 +2835,8 @@ class MainWindow(QMainWindow):
 
     def on_crop_changed(self) -> None:
         self.update_crop_info_label()
-        job = self.current_job()
-        if job is not None:
-            job.status = "編集中"
+        if self.current_job() is not None:
+            self.mark_current_job_dirty(image=True)
 
     def load_mask_dialog(self) -> None:
         job = self.current_job()
@@ -2731,7 +2911,8 @@ class MainWindow(QMainWindow):
         return req
 
     def dry_run_current(self) -> None:
-        self.save_current_job_from_ui()
+        if not self.confirm_unsaved_current_job():
+            return
         job = self.current_job()
         if job is None:
             return
@@ -2743,14 +2924,20 @@ class MainWindow(QMainWindow):
             self.log(f"DryRun失敗: {exc}")
 
     def run_current_job(self) -> None:
+        if not self.confirm_unsaved_current_job():
+            return
         job = self.current_job()
         if job is not None:
             self.start_run_jobs([job])
 
     def run_checked_jobs(self) -> None:
+        if not self.confirm_unsaved_current_job():
+            return
         self.start_run_jobs([j for j in self.jobs if j.checked])
 
     def run_failed_jobs(self) -> None:
+        if not self.confirm_unsaved_current_job():
+            return
         self.start_run_jobs([j for j in self.jobs if "失敗" in j.status])
 
     def request_stop(self) -> None:
@@ -2768,7 +2955,6 @@ class MainWindow(QMainWindow):
         if self._run_thread is not None and self._run_thread.is_alive():
             self.log("実行中です")
             return
-        self.save_current_job_from_ui()
         self._cancel_requested = False
         self.set_running_ui(True)
         self._run_thread = threading.Thread(target=self._run_jobs_worker, args=(list(jobs),), daemon=True)
@@ -3021,7 +3207,11 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._closing_app = True
         try:
-            self.save_project_all()
+            if not self.confirm_unsaved_current_job():
+                event.ignore()
+                self._closing_app = False
+                return
+            self.write_project_index()
             self._save_app_settings()
         except Exception as exc:
             print(f"Close error: {safe_exception_text(exc)}", file=sys.stderr)
